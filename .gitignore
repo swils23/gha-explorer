@@ -33,3 +33,6 @@ build/
 .idea/
 .vscode/
 *.swp
+
+# Built-in GitHub sign-in (only lands here when a checkout doubles as the data dir)
+auth.json

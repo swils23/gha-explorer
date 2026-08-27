@@ -14,7 +14,8 @@ Usage:
     uvx gha-explorer [--repo owner/name] [--theme NAME]
     # or from a checkout:  ./gha_explorer.py
 
-Incrementally fetches successful workflow runs for a repo (via the `gh` CLI),
+Incrementally fetches successful workflow runs for a repo straight from the
+GitHub REST API (no `gh` needed — see `resolve_token()` for how it signs in),
 caching results in SQLite. On subsequent launches, cached data displays
 immediately and only new runs are fetched from the API.
 
@@ -33,6 +34,10 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
 from bisect import bisect_left
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -73,7 +78,7 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option
 from textual.widgets.selection_list import Selection
-from textual.worker import Worker, WorkerState
+from textual.worker import Worker, WorkerState, get_current_worker
 
 # ---------------------------------------------------------------------------
 # Data directory — where cache.db and the log live
@@ -116,7 +121,7 @@ PATHS_FILE = DATA_DIR / PATHS_FILENAME
 
 def _read_paths() -> dict:
     try:
-        return json.loads(PATHS_FILE.read_text()) if PATHS_FILE.exists() else {}
+        return json.loads(PATHS_FILE.read_text(encoding="utf-8")) if PATHS_FILE.exists() else {}
     except Exception:
         return {}
 
@@ -148,7 +153,7 @@ def set_db_path(path: Path) -> None:
     global CACHE_DB
     path = path.expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
-    PATHS_FILE.write_text(json.dumps({"db_path": str(path)}, indent=2))
+    PATHS_FILE.write_text(json.dumps({"db_path": str(path)}, indent=2), encoding="utf-8")
     CACHE_DB = path
 
 
@@ -172,6 +177,7 @@ LOG_FILE = DATA_DIR / "gha_explorer.log"
 
 logging.basicConfig(
     filename=str(LOG_FILE),
+    encoding="utf-8",  # log lines contain → — ·; Windows' default code page can't encode them
     level=logging.DEBUG,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
@@ -587,36 +593,290 @@ def _shard_sort_key(key: str) -> list[object]:
     return [(0, int(part)) if part.isdigit() else (1, part.lower()) for part in re.split(r"(\d+)", key)]
 
 
-def _run_gh(*args: str, retries: int = 4, count: bool = True) -> str:
-    """Run a gh CLI command, returning stdout. Retries on 429 rate-limit."""
+# ---------------------------------------------------------------------------
+# GitHub REST API client + sign-in (stdlib urllib; `gh` is optional)
+# ---------------------------------------------------------------------------
+
+GITHUB_API = "https://api.github.com"
+# Public client ID of the "GHA Explorer" OAuth app. Device flow only — there is
+# no client secret, so it is safe to ship in source.
+GITHUB_OAUTH_CLIENT_ID = "Ov23liOAZ82yZCtwbZOr"
+GITHUB_OAUTH_SCOPE = "repo"  # needed to read Actions data on private repos
+AUTH_FILE = DATA_DIR / "auth.json"
+USER_AGENT = f"gha-explorer/{__version__}"
+
+
+class GitHubAPIError(Exception):
+    """Any failed API call (HTTP error, network error, exhausted rate-limit retries)."""
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class AuthError(GitHubAPIError):
+    """401 — no token, or the token is invalid/revoked. The UI reacts by signing in again."""
+
+
+@dataclass
+class AuthState:
+    token: str | None = None
+    source: str = "none"  # "env", "saved login", "gh CLI" or "none"
+    login: str = ""
+
+
+AUTH = AuthState()
+
+
+def _read_auth_file() -> dict:
+    try:
+        return json.loads(AUTH_FILE.read_text(encoding="utf-8")) if AUTH_FILE.exists() else {}
+    except Exception:
+        log.debug("Could not read %s", AUTH_FILE, exc_info=True)
+        return {}
+
+
+def save_token(token: str, login: str = "") -> None:
+    """Persist a token from the in-app sign-in, readable only by the current user."""
+    AUTH_FILE.write_text(json.dumps({"token": token, "login": login}, indent=2), encoding="utf-8")
+    try:
+        os.chmod(AUTH_FILE, 0o600)  # no-op on Windows, where %LOCALAPPDATA% is already per-user
+    except OSError:
+        log.debug("chmod on %s failed", AUTH_FILE, exc_info=True)
+    AUTH.token, AUTH.source, AUTH.login = token, "saved login", login
+
+
+def clear_saved_token() -> bool:
+    existed = AUTH_FILE.exists()
+    if existed:
+        AUTH_FILE.unlink()
+    if AUTH.source == "saved login":
+        AUTH.token, AUTH.source, AUTH.login = None, "none", ""
+    return existed
+
+
+_gh_token_cache: tuple[bool, str | None] = (False, None)  # (probed, token)
+
+
+def gh_cli_token(refresh: bool = False) -> str | None:
+    """The GitHub CLI's token, if `gh` is installed and signed in. Probed once per
+    process (it spawns a subprocess); `refresh=True` re-probes."""
+    global _gh_token_cache
+    if _gh_token_cache[0] and not refresh:
+        return _gh_token_cache[1]
+    token: str | None = None
+    if shutil.which("gh") is not None:
+        try:
+            result = subprocess.run(
+                ["gh", "auth", "token"], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=15,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                token = result.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            log.debug("gh auth token failed", exc_info=True)
+    _gh_token_cache = (True, token)
+    return token
+
+
+def gh_cli_available() -> bool:
+    return gh_cli_token() is not None
+
+
+AUTH_MODES = ("gh", "rest")
+
+
+def auth_mode() -> str:
+    """Settings → General → GitHub access. "gh" reuses the GitHub CLI's login, "rest"
+    uses the built-in sign-in. Unset means: gh when it's available, rest otherwise."""
+    explicit = settings_get(GLOBAL_SCOPE, "auth_mode")
+    if explicit in AUTH_MODES:
+        return explicit
+    return "gh" if gh_cli_available() else "rest"
+
+
+def resolve_token() -> AuthState:
+    """Find a token without asking. $GH_TOKEN / $GITHUB_TOKEN always win; then the
+    `gh` CLI's login (when the auth mode is "gh"), then the saved in-app login.
+    Sets and returns AUTH; AUTH.token is None if nothing was found."""
+    env = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if env:
+        AUTH.token, AUTH.source, AUTH.login = env.strip(), "env", ""
+    elif auth_mode() == "gh" and (cli := gh_cli_token()):
+        AUTH.token, AUTH.source, AUTH.login = cli, "gh CLI", ""
+    elif (saved := _read_auth_file()).get("token"):
+        AUTH.token, AUTH.source, AUTH.login = saved["token"], "saved login", saved.get("login", "")
+    else:
+        AUTH.token, AUTH.source, AUTH.login = None, "none", ""
+    log.info("Auth source: %s", AUTH.source)
+    return AUTH
+
+
+def auth_status_text() -> str:
+    """One line for Settings / Status describing the credentials in use."""
+    if AUTH.source == "env":
+        return "Using $GH_TOKEN / $GITHUB_TOKEN from the environment (overrides the setting below)."
+    if AUTH.source == "gh CLI":
+        return "Using the GitHub CLI's login (gh auth token)."
+    if AUTH.source == "saved login":
+        who = f" as {AUTH.login}" if AUTH.login else ""
+        return f"Signed in with the built-in login{who}. Token stored in {AUTH_FILE}."
+    return "Not signed in — the app will ask on the next sync, or use Sign in… below."
+
+
+def _api_request(url: str, params: dict | None = None, *, retries: int = 4, count: bool = True,
+                 token: str | None = None) -> tuple[object, object]:
+    """GET one URL. Returns (parsed JSON, response headers).
+
+    Retries with backoff on network errors and on secondary rate limits (Retry-After);
+    waits out a primary rate limit only if it resets within a couple of minutes.
+    Raises AuthError on 401 and GitHubAPIError for anything else that fails.
+    """
+    if params:
+        url = f"{url}{'&' if '?' in url else '?'}{urllib.parse.urlencode(params)}"
+    token = token if token is not None else AUTH.token
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": USER_AGENT,
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     for attempt in range(retries + 1):
-        result = subprocess.run(args, capture_output=True, text=True)
-        if result.returncode == 0:
-            if count:
-                STATS.api_calls += 1
-            return result.stdout
-        stderr = result.stderr.strip()
-        if ("429" in stderr or "rate limit" in stderr.lower()) and attempt < retries:
-            delay = 2 ** attempt  # 1, 2, 4, 8s
-            STATS.rate_limit_retries += 1
-            log.warning("Rate limited, retrying in %ds (attempt %d/%d): %s", delay, attempt + 1, retries, args[1:3])
-            time.sleep(delay)
-            continue
-        STATS.api_errors += 1
-        STATS.last_error = stderr[-200:]
-        log.error("gh command failed (exit %d): %s\nstderr: %s", result.returncode, args, stderr)
-        result.check_returncode()
-    return ""  # unreachable, keeps type checker happy
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                body = resp.read().decode("utf-8")
+                if count:
+                    STATS.api_calls += 1
+                return (json.loads(body) if body.strip() else None), resp.headers
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            body = exc.read().decode("utf-8", "replace")
+            try:
+                message = json.loads(body).get("message", body)
+            except Exception:
+                message = body
+            message = (message or f"HTTP {status}").strip()
+            if status == 401:
+                STATS.api_errors += 1
+                STATS.last_error = f"401 {message}"
+                raise AuthError(f"GitHub rejected the token (401): {message}", status) from None
+            retry_after = exc.headers.get("Retry-After")
+            remaining = exc.headers.get("X-RateLimit-Remaining")
+            rate_limited = status in (403, 429) and (
+                retry_after is not None or remaining == "0" or "rate limit" in message.lower()
+            )
+            if rate_limited and attempt < retries:
+                if retry_after:
+                    delay = min(int(float(retry_after)), 120)
+                elif remaining == "0":
+                    reset_in = int(exc.headers.get("X-RateLimit-Reset", "0")) - time.time()
+                    if reset_in > 120:
+                        STATS.api_errors += 1
+                        STATS.last_error = f"rate limited, resets in {int(reset_in // 60)}m"
+                        raise GitHubAPIError(
+                            f"API rate limit exhausted — resets in {int(reset_in // 60)} min", status
+                        ) from None
+                    delay = max(1, int(reset_in) + 1)
+                else:
+                    delay = 2 ** attempt
+                STATS.rate_limit_retries += 1
+                log.warning("Rate limited (%d), retrying in %ds (attempt %d/%d): %s",
+                            status, delay, attempt + 1, retries, url.split("?")[0])
+                time.sleep(delay)
+                continue
+            STATS.api_errors += 1
+            STATS.last_error = f"{status} {message}"[-200:]
+            log.error("API call failed (HTTP %d): %s\n%s", status, url, message)
+            raise GitHubAPIError(f"HTTP {status}: {message}", status) from None
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if attempt < retries:
+                delay = 2 ** attempt
+                log.warning("Network error, retrying in %ds: %s", delay, exc)
+                time.sleep(delay)
+                continue
+            STATS.api_errors += 1
+            STATS.last_error = f"network: {exc}"[-200:]
+            log.error("API call failed (network): %s\n%s", url, exc)
+            raise GitHubAPIError(f"Network error: {exc}") from None
+    raise GitHubAPIError("unreachable")  # keeps type checkers happy
 
 
-def gh_api(endpoint: str) -> dict:
-    return json.loads(_run_gh("gh", "api", endpoint, "--paginate"))
+def _next_link(headers) -> str | None:
+    link = headers.get("Link") if headers is not None else None
+    if not link:
+        return None
+    for part in link.split(","):
+        url, _, rel = part.partition(";")
+        if 'rel="next"' in rel:
+            return url.strip().strip("<>")
+    return None
 
+
+def api_get(path: str, params: dict | None = None, **kw) -> object:
+    return _api_request(f"{GITHUB_API}/{path.lstrip('/')}", params, **kw)[0]
+
+
+def api_get_all(path: str, params: dict | None = None, *, list_key: str | None = None,
+                max_items: int | None = None) -> list:
+    """Follow `Link: rel=next` pagination. `list_key` unwraps envelope responses
+    like {"workflow_runs": [...]}; `max_items` stops early."""
+    url: str | None = f"{GITHUB_API}/{path.lstrip('/')}"
+    params = {**(params or {}), "per_page": 100}
+    items: list = []
+    while url:
+        data, headers = _api_request(url, params)
+        params = None  # the next link already carries the query string
+        page = data.get(list_key, []) if list_key else data
+        items.extend(page)
+        if max_items is not None and len(items) >= max_items:
+            return items[:max_items]
+        if list_key and not page:
+            break
+        url = _next_link(headers)
+    return items
+
+
+def verify_token(token: str) -> str:
+    """Return the login for `token`, raising AuthError if GitHub rejects it."""
+    user = _api_request(f"{GITHUB_API}/user", token=token, retries=1, count=False)[0]
+    return str((user or {}).get("login", ""))
+
+
+# -- OAuth device flow (https://docs.github.com/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps#device-flow)
+
+def _oauth_post(url: str, data: dict) -> dict:
+    req = urllib.request.Request(
+        url, data=urllib.parse.urlencode(data).encode(), method="POST",
+        headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def device_flow_start() -> dict:
+    """Ask GitHub for a user code. Returns {device_code, user_code, verification_uri, interval, expires_in}."""
+    return _oauth_post("https://github.com/login/device/code",
+                       {"client_id": GITHUB_OAUTH_CLIENT_ID, "scope": GITHUB_OAUTH_SCOPE})
+
+
+def device_flow_poll(device_code: str) -> dict:
+    """One poll. Returns {"access_token": ...} on success or {"error": ...} while pending
+    (authorization_pending, slow_down, expired_token, access_denied)."""
+    return _oauth_post("https://github.com/login/oauth/access_token", {
+        "client_id": GITHUB_OAUTH_CLIENT_ID,
+        "device_code": device_code,
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+    })
+
+
+# -- Endpoints used by the app
 
 def fetch_rate_limit() -> dict | None:
     """Core rate-limit bucket. This endpoint doesn't count against the limit."""
     try:
-        data = json.loads(_run_gh("gh", "api", "rate_limit", retries=0, count=False))
+        data = api_get("rate_limit", retries=0, count=False)
         core = data["resources"]["core"]
         STATS.rate_limit = core
         STATS.rate_limit_checked_at = time.monotonic()
@@ -628,12 +888,7 @@ def fetch_rate_limit() -> dict | None:
 
 def fetch_user_repos() -> list[dict]:
     """List all repos the user can access — personal, collaborator, and org member."""
-    data = _run_gh(
-        "gh", "api",
-        "user/repos?affiliation=owner,collaborator,organization_member&per_page=100&sort=pushed",
-        "--paginate",
-    )
-    raw = json.loads(data)
+    raw = api_get_all("user/repos", {"affiliation": "owner,collaborator,organization_member", "sort": "pushed"})
     repos = [
         {
             "nameWithOwner": r["full_name"],
@@ -648,15 +903,22 @@ def fetch_user_repos() -> list[dict]:
     return repos
 
 
+_GITHUB_REMOTE_RE = re.compile(r"github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?/?$")
+
+
 def detect_current_repo() -> str | None:
-    """If run from inside a git repo that has a GitHub remote, return owner/name."""
+    """If run from inside a git checkout whose `origin` points at GitHub, return owner/name."""
+    if shutil.which("git") is None:
+        return None
     try:
         result = subprocess.run(
-            ["gh", "repo", "view", "--json", "nameWithOwner"],
-            capture_output=True, text=True,
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
         )
         if result.returncode == 0:
-            return json.loads(result.stdout).get("nameWithOwner")
+            m = _GITHUB_REMOTE_RE.search(result.stdout.strip())
+            if m:
+                return f"{m.group(1)}/{m.group(2)}"
     except Exception:
         log.debug("Could not detect current repo", exc_info=True)
     return None
@@ -665,8 +927,9 @@ def detect_current_repo() -> str | None:
 def fetch_repo_created_at(repo: str) -> datetime | None:
     """Repo creation date — the floor for backfill. None if unavailable."""
     try:
-        out = _run_gh("gh", "repo", "view", repo, "--json", "createdAt", retries=1)
-        return parse_dt(json.loads(out)["createdAt"])
+        return parse_dt(api_get(f"repos/{repo}", retries=1)["created_at"])
+    except AuthError:
+        raise
     except Exception:
         log.debug("Could not fetch repo createdAt", exc_info=True)
         return None
@@ -702,7 +965,7 @@ def migrate_config_json() -> None:
     if settings_get(GLOBAL_SCOPE, "current_repo") is not None or not CONFIG_FILE.exists():
         return
     try:
-        cfg = json.loads(CONFIG_FILE.read_text())
+        cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
     except Exception:
         log.debug("Could not read legacy config.json", exc_info=True)
         return
@@ -990,25 +1253,32 @@ def fetch_run_list(
     since_date: str | None = None,
     until_date: str | None = None,
 ) -> list[dict]:
-    """One `gh run list` call (successful runs, all workflows), newest-first.
+    """One listing of successful runs (all workflows), newest-first.
 
-    Date bounds are inclusive at day granularity. Capped at RUN_LIST_LIMIT —
-    use `fetch_run_list_complete` when the window might exceed that.
+    Date bounds are inclusive at day granularity. Capped at RUN_LIST_LIMIT — the
+    API stops serving pages past 1000 results — so use `fetch_run_list_complete`
+    when the window might exceed that. Rows are normalised to the field names the
+    cache has always stored (`databaseId`, `workflowName`, ...).
     """
-    args = [
-        "gh", "run", "list",
-        "--repo", repo,
-        "--status", "success",
-        "--limit", str(RUN_LIST_LIMIT),
-        "--json", "databaseId,displayTitle,headBranch,conclusion,createdAt,workflowName",
-    ]
+    params: dict[str, str] = {"status": "success"}
     if since_date and until_date:
-        args.extend(["--created", f"{since_date[:10]}..{until_date[:10]}"])
+        params["created"] = f"{since_date[:10]}..{until_date[:10]}"
     elif since_date:
-        args.extend(["--created", f">={since_date[:10]}"])
+        params["created"] = f">={since_date[:10]}"
     elif until_date:
-        args.extend(["--created", f"<={until_date[:10]}"])
-    return json.loads(_run_gh(*args))
+        params["created"] = f"<={until_date[:10]}"
+    raw = api_get_all(f"repos/{repo}/actions/runs", params, list_key="workflow_runs", max_items=RUN_LIST_LIMIT)
+    return [
+        {
+            "databaseId": r["id"],
+            "displayTitle": r.get("display_title") or r.get("name") or "",
+            "headBranch": r.get("head_branch") or "",
+            "conclusion": r.get("conclusion"),
+            "createdAt": r.get("created_at") or "",
+            "workflowName": r.get("name") or "",
+        }
+        for r in raw
+    ]
 
 
 def fetch_run_list_complete(
@@ -1043,8 +1313,7 @@ def fetch_run_list_complete(
 
 
 def fetch_run_jobs(repo: str, run_id: int) -> list[dict]:
-    data = gh_api(f"repos/{repo}/actions/runs/{run_id}/jobs")
-    return data.get("jobs", [])
+    return api_get_all(f"repos/{repo}/actions/runs/{run_id}/jobs", list_key="jobs")
 
 
 def build_run_data(raw_run: dict, raw_jobs: list[dict]) -> RunData:
@@ -1102,7 +1371,9 @@ def _fetch_and_build(repo: str, raw_run: dict, retries: int = 2) -> RunData:
             raw_jobs = fetch_run_jobs(repo, run_id)
             cache_put_jobs(repo, run_id, raw_run, raw_jobs)
             return build_run_data(raw_run, raw_jobs)
-        except subprocess.CalledProcessError:
+        except AuthError:
+            raise
+        except GitHubAPIError:
             if attempt == retries:
                 raise
             time.sleep(1 * (attempt + 1))
@@ -1125,6 +1396,10 @@ def _fetch_jobs_for_runs(repo: str, raw_runs: list[dict]) -> list[RunData]:
             raw = futures[future]
             try:
                 runs.append(future.result())
+            except AuthError:
+                for f in futures:
+                    f.cancel()
+                raise
             except Exception:
                 errors += 1
                 log.exception("Failed to fetch/build run %s", raw.get("databaseId"))
@@ -1162,7 +1437,9 @@ def fetch_incremental(repo: str, force_backfill: bool = False) -> list[RunData]:
 
     try:
         forward_raw = fetch_run_list_complete(repo, since_date=newest_date)
-    except subprocess.CalledProcessError:
+    except AuthError:
+        raise
+    except GitHubAPIError:
         log.warning("Forward fetch failed — likely rate limited")
         STATS.set_phase("rate-limited", "Rate limited — showing cached data")
         STATS.finished_at = time.monotonic()
@@ -1199,7 +1476,9 @@ def fetch_incremental(repo: str, force_backfill: bool = False) -> list[RunData]:
                 backfill_raw = fetch_run_list_complete(
                     repo, since_date=window_start.isoformat(), until_date=window_end.isoformat(),
                 )
-            except subprocess.CalledProcessError:
+            except AuthError:
+                raise
+            except GitHubAPIError:
                 log.warning("Backfill stopped — API error (likely rate limited)")
                 STATS.set_phase("rate-limited", "Backfill paused — rate limited, will resume next launch")
                 break
@@ -1482,6 +1761,217 @@ class Gauge(Static):
         self.update(text)
 
 
+class LoginScreen(ModalScreen[str | None]):
+    """Sign in to GitHub: OAuth device flow (code + browser) or a pasted token.
+
+    Dismisses with the token (already saved to AUTH_FILE) or None if cancelled.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    CSS = """
+    LoginScreen {
+        align: center middle;
+    }
+    #login-box {
+        width: 78;
+        height: auto;
+        border: round $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    #login-title {
+        text-style: bold;
+        color: $primary;
+        margin-bottom: 1;
+    }
+    .login-hint {
+        color: $text-muted;
+        height: auto;
+        margin-bottom: 1;
+    }
+    .login-heading {
+        text-style: bold;
+        margin-top: 1;
+    }
+    #login-code {
+        height: auto;
+        margin: 1 0;
+    }
+    #login-actions, #login-token-row {
+        height: 3;
+    }
+    #login-actions Button, #login-token-row Button {
+        margin-right: 1;
+    }
+    #login-token {
+        width: 1fr;
+        margin-right: 1;
+    }
+    #login-status {
+        height: auto;
+        color: $warning;
+        margin-bottom: 1;
+    }
+    """
+
+    def __init__(self, reason: str = "") -> None:
+        super().__init__()
+        self._reason = reason
+        self._verification_uri = "https://github.com/login/device"
+        self._user_code = ""
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="login-box"):
+            yield Label("Sign in to GitHub", id="login-title")
+            yield Static(
+                self._reason or "GHA Explorer reads workflow runs through the GitHub API and needs to sign in "
+                "once. The token is stored in your data directory, readable only by you.",
+                classes="login-hint",
+            )
+            yield Label("Option 1 — authorize in your browser", classes="login-heading")
+            yield Static("Requesting a code from GitHub…", id="login-code")
+            with Horizontal(id="login-actions"):
+                yield Button("Open browser", id="login-open", variant="primary", disabled=True)
+                yield Button("New code", id="login-restart", disabled=True)
+            yield Static("", id="login-status")
+            yield Label("Option 2 — paste a personal access token", classes="login-heading")
+            with Horizontal(id="login-token-row"):
+                yield Input(placeholder="ghp_… or github_pat_…", password=True, id="login-token")
+                yield Button("Use token", id="login-use-token")
+            yield Static(
+                "Classic tokens need the repo scope; fine-grained tokens need Actions: read and Metadata: read "
+                "on the repositories you want to explore. Esc cancels.",
+                classes="login-hint",
+            )
+
+    def on_mount(self) -> None:
+        self._device_flow()
+
+    # -- device flow (runs in a thread; UI updates hop back via call_from_thread) --
+
+    @work(thread=True, exclusive=True, group="device-flow", exit_on_error=False)
+    def _device_flow(self) -> None:
+        worker = get_current_worker()
+        try:
+            info = device_flow_start()
+        except Exception as exc:
+            log.warning("Device flow start failed: %s", exc)
+            self.app.call_from_thread(self._set_status, f"Couldn't start the browser sign-in: {exc}")
+            self.app.call_from_thread(self._set_restart_enabled, True)
+            return
+        self.app.call_from_thread(self._show_code, info)
+        interval = int(info.get("interval", 5))
+        deadline = time.monotonic() + int(info.get("expires_in", 900))
+        while not worker.is_cancelled and time.monotonic() < deadline:
+            time.sleep(interval)
+            if worker.is_cancelled:
+                return
+            try:
+                result = device_flow_poll(info["device_code"])
+            except Exception as exc:
+                log.debug("Device flow poll failed: %s", exc)
+                continue
+            if token := result.get("access_token"):
+                try:
+                    login = verify_token(token)
+                except Exception:
+                    login = ""
+                self.app.call_from_thread(self._finish, token, login)
+                return
+            error = result.get("error")
+            if error == "authorization_pending":
+                continue
+            if error == "slow_down":
+                interval += 5
+                continue
+            if error == "expired_token":
+                break
+            if error == "access_denied":
+                self.app.call_from_thread(self._set_status, "Authorization was denied on GitHub. Press New code to try again.")
+                self.app.call_from_thread(self._set_restart_enabled, True)
+                return
+            self.app.call_from_thread(self._set_status, f"GitHub replied: {error}. Press New code to try again.")
+            self.app.call_from_thread(self._set_restart_enabled, True)
+            return
+        if not worker.is_cancelled:
+            self.app.call_from_thread(self._set_status, "That code expired. Press New code for a fresh one.")
+            self.app.call_from_thread(self._set_restart_enabled, True)
+
+    def _show_code(self, info: dict) -> None:
+        self._verification_uri = info.get("verification_uri", self._verification_uri)
+        self._user_code = info.get("user_code", "")
+        text = RichText()
+        text.append("Open  ", style="bold")
+        text.append(self._verification_uri, style="underline")
+        text.append("  and enter the code  ", style="bold")
+        text.append(f" {self._user_code} ", style="bold reverse")
+        self.query_one("#login-code", Static).update(text)
+        self.query_one("#login-open", Button).disabled = False
+        self.query_one("#login-restart", Button).disabled = False
+        self._set_status("Waiting for you to authorize in the browser…")
+
+    def _set_status(self, message: str) -> None:
+        try:
+            self.query_one("#login-status", Static).update(message)
+        except Exception:
+            pass  # screen already dismissed
+
+    def _set_restart_enabled(self, enabled: bool) -> None:
+        try:
+            self.query_one("#login-restart", Button).disabled = not enabled
+        except Exception:
+            pass
+
+    def _finish(self, token: str, login: str) -> None:
+        save_token(token, login)
+        log.info("Signed in to GitHub%s", f" as {login}" if login else "")
+        self.dismiss(token)
+
+    @on(Button.Pressed, "#login-open")
+    def _open_browser(self) -> None:
+        try:
+            opened = webbrowser.open(self._verification_uri)
+        except Exception:
+            opened = False
+        if not opened:
+            self._set_status(f"Couldn't open a browser here — visit {self._verification_uri} yourself and enter {self._user_code}.")
+
+    @on(Button.Pressed, "#login-restart")
+    def _restart(self) -> None:
+        self.query_one("#login-restart", Button).disabled = True
+        self.query_one("#login-code", Static).update("Requesting a new code from GitHub…")
+        self._device_flow()
+
+    # -- pasted token --
+
+    @on(Button.Pressed, "#login-use-token")
+    @on(Input.Submitted, "#login-token")
+    def _use_token(self) -> None:
+        token = self.query_one("#login-token", Input).value.strip()
+        if not token:
+            self._set_status("Paste a token first.")
+            return
+        self._set_status("Checking the token…")
+        self._verify_pasted(token)
+
+    @work(thread=True, exclusive=True, group="verify-token", exit_on_error=False)
+    def _verify_pasted(self, token: str) -> None:
+        try:
+            login = verify_token(token)
+        except AuthError:
+            self.app.call_from_thread(self._set_status, "GitHub rejected that token.")
+            return
+        except Exception as exc:
+            self.app.call_from_thread(self._set_status, f"Couldn't verify the token: {exc}")
+            return
+        self.app.call_from_thread(self._finish, token, login)
+
+    def action_cancel(self) -> None:
+        self.workers.cancel_group(self, "device-flow")
+        self.dismiss(None)
+
+
 class RepoPickerScreen(ModalScreen[str | None]):
     """Modal screen that lists accessible repos with type-to-filter search."""
 
@@ -1547,9 +2037,10 @@ class RepoPickerScreen(ModalScreen[str | None]):
                 f"{len(self._all_repos)} repos — type to filter, ↓ to list, Enter to select, Esc to cancel"
             )
         elif event.state == WorkerState.ERROR:
-            self.query_one("#picker-status", Static).update(
-                f"Error loading repos: {event.worker.error}"
-            )
+            err = event.worker.error
+            msg = ("Not signed in — Esc, then sign in via Settings → General → GitHub access."
+                   if isinstance(err, AuthError) else f"Error loading repos: {err}")
+            self.query_one("#picker-status", Static).update(msg)
 
     def _render_repo_list(self, repos: list[dict]) -> None:
         lst = self.query_one("#repo-list", OptionList)
@@ -2193,6 +2684,19 @@ class SettingsScreen(Screen[bool]):
     #db-status {
         color: $success;
     }
+    #auth-mode {
+        height: auto;
+        margin-bottom: 1;
+    }
+    #auth-row {
+        height: 3;
+    }
+    #auth-row Button {
+        margin-right: 1;
+    }
+    #auth-status {
+        color: $success;
+    }
     #group-members {
         height: 2fr;
         min-height: 5;
@@ -2289,6 +2793,19 @@ class SettingsScreen(Screen[bool]):
                     "(or set GHA_EXPLORER_DB).",
                     classes="settings-hint",
                 )
+                yield Label("GitHub access  (applies to every repository)", classes="settings-heading")
+                gh_ok = gh_cli_available()
+                mode = auth_mode()
+                with RadioSet(id="auth-mode"):
+                    yield RadioButton("GitHub CLI — reuse the login from `gh auth login`", value=mode == "gh",
+                                      id="auth-gh", disabled=not gh_ok)
+                    yield RadioButton("Built-in sign-in — authorize in your browser, or paste a token",
+                                      value=mode == "rest", id="auth-rest")
+                yield Static(auth_status_text(), id="auth-status", classes="settings-hint")
+                with Horizontal(id="auth-row"):
+                    yield Button("Sign in…", id="auth-login", variant="primary")
+                    yield Button("Sign out of built-in login", id="auth-logout", disabled=not AUTH_FILE.exists())
+                yield Static(self._auth_help_text(gh_ok), id="auth-help", classes="settings-hint")
             with Vertical(id="groups"):
                 yield Static(
                     "Combine jobs that should be treated as one — matrix shards like Tests (1) / Tests (2), or a "
@@ -2507,6 +3024,55 @@ class SettingsScreen(Screen[bool]):
         if 5 <= value <= 201 and value != self.cfg.outlier_window:
             self.cfg.outlier_window = value
             self._save()
+
+    # -- GitHub access --
+
+    @staticmethod
+    def _auth_help_text(gh_ok: bool) -> str:
+        text = ("Runs are always fetched from the GitHub REST API; this only chooses whose credentials are sent. "
+                "The GitHub CLI option is the default whenever `gh` is installed and signed in, so existing gh users "
+                "never see a sign-in prompt. The built-in sign-in stores its own token in auth.json in the data "
+                "directory. $GH_TOKEN / $GITHUB_TOKEN, when set, override both.")
+        if not gh_ok:
+            text = ("The GitHub CLI option is disabled because `gh` isn't installed or isn't signed in — install it "
+                    "from https://cli.github.com/ and run `gh auth login`, then reopen Settings. Until then the "
+                    "built-in sign-in is used.  " + text)
+        return text
+
+    def _refresh_auth_status(self) -> None:
+        self.query_one("#auth-status", Static).update(auth_status_text())
+        self.query_one("#auth-logout", Button).disabled = not AUTH_FILE.exists()
+
+    @on(RadioSet.Changed, "#auth-mode")
+    def _on_auth_mode(self, event: RadioSet.Changed) -> None:
+        mode = "gh" if (event.pressed.id == "auth-gh") else "rest"
+        settings_set(GLOBAL_SCOPE, "auth_mode", mode)
+        resolve_token()
+        self._refresh_auth_status()
+        if AUTH.token is None:
+            self.app.push_screen(LoginScreen(), self._after_login)
+
+    @on(Button.Pressed, "#auth-login")
+    def _sign_in(self) -> None:
+        if self.query_one("#auth-gh", RadioButton).value:
+            # Signing in explicitly means the built-in login from now on.
+            with self.prevent(RadioSet.Changed):
+                self.query_one("#auth-rest", RadioButton).value = True
+            settings_set(GLOBAL_SCOPE, "auth_mode", "rest")
+        self.app.push_screen(LoginScreen(), self._after_login)
+
+    def _after_login(self, token: str | None) -> None:
+        resolve_token()
+        self._refresh_auth_status()
+
+    @on(Button.Pressed, "#auth-logout")
+    def _sign_out(self) -> None:
+        clear_saved_token()
+        resolve_token()
+        self._refresh_auth_status()
+        if AUTH.token is None:
+            self.query_one("#auth-status", Static).update(
+                "Signed out. The app will ask you to sign in on the next sync.")
 
     @on(Button.Pressed, "#db-reveal")
     def _reveal_db(self) -> None:
@@ -2926,9 +3492,27 @@ class FilterSidebar(Vertical):
     FilterSidebar OptionList:focus, FilterSidebar SelectionList:focus {
         border: none;
     }
+    FilterSidebar .sidebar-footer {
+        dock: bottom;
+        height: 1;
+        align-horizontal: right;
+        padding-right: 1;
+    }
+    FilterSidebar .sidebar-collapse {
+        min-width: 3;
+        width: 3;
+        background: $panel;
+        color: $text-muted;
+    }
+    FilterSidebar .sidebar-collapse:hover {
+        background: $secondary 40%;
+        color: $text;
+    }
     """
 
     def compose(self) -> ComposeResult:
+        with Horizontal(classes="sidebar-footer"):
+            yield Button("<", classes="sidebar-collapse", compact=True, tooltip="Collapse filters (f)")
         yield Label("Workflow")
         yield OptionList(classes="workflow-select")
         yield Label("Job")
@@ -3100,6 +3684,25 @@ class GHAExplorerApp(App):
         height: auto;
         padding: 0 1;
     }
+    .sidebar-strip {
+        width: 3;
+        height: 1fr;
+        border-right: solid $secondary;
+        background: $surface;
+        padding: 1 0 1 0;
+        display: none;
+    }
+    .sidebar-strip Button {
+        dock: bottom;
+        min-width: 3;
+        width: 3;
+        background: $panel;
+        color: $text-muted;
+    }
+    .sidebar-strip Button:hover {
+        background: $secondary 40%;
+        color: $text;
+    }
 
     /* Status tab */
     .status-pane {
@@ -3209,6 +3812,8 @@ class GHAExplorerApp(App):
             yield Static("[@click=app.open_settings]⚙ Settings[/]", id="settings-button")
         with ContentSwitcher(initial="trends", id="content"):
             with Horizontal(id="trends"):
+                with Vertical(classes="sidebar-strip"):
+                    yield Button(">", classes="sidebar-expand", compact=True, tooltip="Show filters (f)")
                 yield FilterSidebar()
                 with Vertical(classes="tab-body"):
                     with Horizontal(id="trends-header"):
@@ -3217,6 +3822,8 @@ class GHAExplorerApp(App):
                     with VerticalScroll(id="trends-scroll"):
                         yield TrendChart(id="trends-body")
             with Horizontal(id="runs-tab"):
+                with Vertical(classes="sidebar-strip"):
+                    yield Button(">", classes="sidebar-expand", compact=True, tooltip="Show filters (f)")
                 yield FilterSidebar()
                 yield DataTable(id="runs-table", classes="tab-body")
             with Vertical(id="status-tab", classes="status-pane"):
@@ -3243,9 +3850,30 @@ class GHAExplorerApp(App):
         self._apply_sidebar_visibility()
         self.call_after_refresh(self._fit_tabs)
         self.set_interval(0.25, self._tick)
+        resolve_token()
+        if AUTH.token is None:
+            self._update_status_bar("", "Sign in to GitHub to begin...")
+            self.push_screen(LoginScreen(), self._on_signed_in)
+        else:
+            self._begin()
+
+    def _on_signed_in(self, token: str | None) -> None:
+        if not token:
+            self.exit(message="Sign-in cancelled — GHA Explorer needs GitHub access to fetch runs.")
+            return
+        self._begin()
+
+    def _begin(self) -> None:
+        """Start up once credentials are in place: rate-limit polling, then the repo."""
         self.set_interval(30, self._poll_rate_limit)
         self._poll_rate_limit()
-        repo = self._initial_repo or settings_get(GLOBAL_SCOPE, "current_repo") or detect_current_repo()
+        # --repo wins; then the GitHub repo of the directory we were launched in (so
+        # `uvx gha-explorer` inside a checkout just works); then the last-used repo.
+        detected = None if self._initial_repo else detect_current_repo()
+        repo = self._initial_repo or detected or settings_get(GLOBAL_SCOPE, "current_repo")
+        if detected and detected != settings_get(GLOBAL_SCOPE, "current_repo"):
+            log.info("Detected %s from the current directory", detected)
+            self.notify(f"Exploring {detected} — detected from the current directory. Press s to switch.", timeout=6)
         if repo:
             self._use_repo(repo)
             saved_tab = settings_get(GLOBAL_SCOPE, "active_tab", "trends")
@@ -3408,6 +4036,11 @@ class GHAExplorerApp(App):
             rate_gauge.set_value(0, 0)
             api_status.update(RichText("rate limit unknown", style=p.muted_hex))
         api_details = RichText()
+        auth_label = {"env": "$GH_TOKEN", "gh CLI": "gh CLI login", "saved login": "built-in login",
+                      "none": "not signed in"}.get(AUTH.source, AUTH.source)
+        if AUTH.login:
+            auth_label += f" ({AUTH.login})"
+        api_details.append(f"Auth:                {auth_label}\n")
         api_details.append(f"Calls this session:  {s['api_calls']:,}\n")
         api_details.append(f"Rate-limit retries:  {s['rate_limit_retries']}\n",
                            style=p.warning_hex if s["rate_limit_retries"] else "")
@@ -3468,6 +4101,30 @@ class GHAExplorerApp(App):
         elif event.state == WorkerState.ERROR:
             log.error("Worker failed: %s", event.worker.error)
             self._data_error(str(event.worker.error))
+            if isinstance(event.worker.error, AuthError):
+                self._handle_auth_error()
+
+    def _handle_auth_error(self) -> None:
+        """GitHub returned 401: drop a bad saved login and ask the user to sign in again."""
+        source = AUTH.source
+        if source == "saved login":
+            clear_saved_token()
+        reason = {
+            "env": "GitHub rejected the token in $GH_TOKEN / $GITHUB_TOKEN. Fix or unset it, or sign in here "
+                   "(the environment variable will still take precedence next launch).",
+            "gh CLI": "GitHub rejected the GitHub CLI's token. Run `gh auth login`, or sign in here instead.",
+            "saved login": "Your saved login is no longer valid (revoked or expired). Sign in again.",
+        }.get(source, "GitHub requires authentication to read this repository's workflow runs.")
+        if any(isinstance(scr, LoginScreen) for scr in self.screen_stack):
+            return
+        self.push_screen(LoginScreen(reason=reason), self._on_reauth)
+
+    def _on_reauth(self, token: str | None) -> None:
+        if token:
+            resolve_token()
+            self._start_fetch()
+        else:
+            self._update_status_bar(self._cache_status_text(), "Not signed in — press r to retry after signing in.")
 
     def _data_loaded(self, data: list[RunData]) -> None:
         try:
@@ -3744,6 +4401,14 @@ class GHAExplorerApp(App):
     def _apply_sidebar_visibility(self) -> None:
         for sidebar in self.query(FilterSidebar):
             sidebar.display = self._sidebar_visible
+        for strip in self.query(".sidebar-strip"):
+            strip.display = not self._sidebar_visible
+
+    @on(Button.Pressed, ".sidebar-collapse")
+    @on(Button.Pressed, ".sidebar-expand")
+    def _on_sidebar_button(self, event: Button.Pressed) -> None:
+        event.stop()
+        self.action_toggle_sidebar()
 
     def action_toggle_sidebar(self) -> None:
         """Collapse/expand the filter sidebar (persisted across launches)."""
@@ -4127,6 +4792,10 @@ def main():
     )
     parser.add_argument("--version", action="version", version=f"gha-explorer {__version__}")
     parser.add_argument(
+        "--logout", action="store_true",
+        help="Forget the built-in GitHub sign-in (auth.json) and exit. Does not touch the gh CLI's login.",
+    )
+    parser.add_argument(
         "--data-dir", action="store_true",
         help=f"Print the data directory (cache.db, log) and exit. Currently: {DATA_DIR}",
     )
@@ -4135,11 +4804,9 @@ def main():
         print(DATA_DIR)
         return
 
-    if shutil.which("gh") is None:
-        sys.exit(
-            "gha-explorer needs the GitHub CLI (`gh`) on your PATH, but it wasn't found.\n"
-            "Install it from https://cli.github.com/ and then run `gh auth login`."
-        )
+    if args.logout:
+        print("Removed the saved GitHub login." if clear_saved_token() else "No saved GitHub login to remove.")
+        return
 
     log.info("=" * 60)
     log.info("Starting GHA Explorer %s (data dir: %s)", __version__, DATA_DIR)

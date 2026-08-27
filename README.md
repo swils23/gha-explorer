@@ -1,6 +1,6 @@
 # GHA Explorer
 
-A terminal UI for exploring GitHub Actions workflow timing data. Fetches successful workflow runs from any repo you have access to via the `gh` CLI, caches everything locally in SQLite, and shows interactive trend charts of pipeline and job durations.
+A terminal UI for exploring GitHub Actions workflow timing data. Fetches successful workflow runs from any repo you have access to straight from the GitHub API, caches everything locally in SQLite, and shows interactive trend charts of pipeline and job durations.
 
 ![Hero screenshot](docs/images/hero.png)
 
@@ -18,14 +18,16 @@ A terminal UI for exploring GitHub Actions workflow timing data. Fetches success
 - **Notes** — pin a note to a date/time ("switched runners", "enabled test cache"). It's drawn as a red vertical line on the trend charts with a clickable ⓘ that pops the note in a bubble, so you can eyeball before/after. A note applies to the job you're viewing by default, or to several jobs, or to all jobs (including ones that don't exist yet). Notes on jobs that later get grouped show on the group's chart prefixed with the source job. Each note has a colour (red by default). Manage them via `ⓘ Notes` at the right of the stats line or `n`; a note's bubble has Edit and Delete (with confirmation).
 - **Sticky state** — repo, active tab, sidebar collapsed, and per-repo filter selections (workflow, job, branches, time range, y-axis) are saved in the database and restored next launch.
 - **Status tab** — live sync phase and progress, GitHub API rate-limit gauge, call/error counters, cache stats, and a streaming log.
-- **Resilient** — walks past `gh run list`'s 1000-result cap, handles rate limiting gracefully, and backfill resumes next launch.
+- **Resilient** — walks past the API's 1000-result cap per query, backs off on rate limits, and backfill resumes next launch.
+- **No `gh` required** — talks to the GitHub REST API directly. If you have the `gh` CLI signed in it reuses that login silently; otherwise a one-time in-app sign-in (browser device flow, or paste a token).
 - **Dark lavender theme** — plus `--theme` to use any built-in Textual theme (charts recolor to match).
 
 ## Requirements
 
 - [`uv`](https://github.com/astral-sh/uv) — provides `uvx`; it fetches Python 3.11+ and the dependencies for you
 - Charts use [plotext 6](https://pypi.org/project/plotext/), which ships compiled wheels for macOS (Intel/Apple silicon), Linux (x86_64/aarch64) and Windows x86_64; other platforms need a C compiler to build it
-- [`gh`](https://cli.github.com/) — GitHub CLI, authenticated (`gh auth login`)
+- A GitHub account. The [`gh`](https://cli.github.com/) CLI is optional — see [Signing in](#signing-in).
+- On Windows, use Windows Terminal (or another modern terminal) for colours, glyphs and mouse support.
 
 ## Run
 
@@ -56,11 +58,22 @@ From a checkout, the single file still runs directly (it carries inline script m
 ./gha_explorer.py            # or: uv run --script gha_explorer.py
 ```
 
-First launch shows a repo picker listing every repo you have access to. Pick one, and it starts fetching. On subsequent launches your choice — plus filters, active tab and sidebar state — is remembered.
+Run it inside a git checkout whose `origin` is on GitHub and it opens that repository. Otherwise the first launch shows a repo picker listing every repo you have access to; pick one and it starts fetching. Your last choice — plus filters, active tab and sidebar state — is remembered for launches outside a checkout. `s` switches repo at any time.
+
+### Signing in
+
+Credentials are looked up in this order, and you're only asked if none apply:
+
+1. `GH_TOKEN` / `GITHUB_TOKEN` in the environment.
+2. The `gh` CLI's login (`gh auth token`), when `gh` is installed and signed in — the default for gh users, so nothing changes for you.
+3. The built-in sign-in, saved from a previous launch.
+4. Otherwise a sign-in dialog: authorize in your browser with a one-time code (GitHub's device flow, the same mechanism `gh auth login` uses), or paste a personal access token (classic: `repo` scope; fine-grained: *Actions: read* + *Metadata: read*). The token is saved in `auth.json` in the data directory, readable only by you.
+
+Settings → General → **GitHub access** switches between the `gh` login and the built-in sign-in (the `gh` option is disabled, with an explanation, when `gh` isn't available), and has Sign in / Sign out buttons. `gha-explorer --logout` forgets the built-in login from the command line.
 
 ### Where data lives
 
-Everything — the runs cache, settings and notes — lives in one SQLite file, `gha-explorer.db`, alongside the log in a per-user directory: `~/.local/share/gha-explorer` (or `$XDG_DATA_HOME/gha-explorer`; `%LOCALAPPDATA%\gha-explorer` on Windows). Set `GHA_EXPLORER_HOME` to put the directory somewhere else, and `gha-explorer --data-dir` prints the resolved path. A checkout that already has a database next to the script keeps using it, and a `cache.db` from before the first release is renamed on first launch.
+Everything — the runs cache, settings and notes — lives in one SQLite file, `gha-explorer.db`, alongside the log and the saved login (`auth.json`) in a per-user directory: `~/.local/share/gha-explorer` (or `$XDG_DATA_HOME/gha-explorer`; `%LOCALAPPDATA%\gha-explorer` on Windows). Set `GHA_EXPLORER_HOME` to put the directory somewhere else, and `gha-explorer --data-dir` prints the resolved path. A checkout that already has a database next to the script keeps using it, and a `cache.db` from before the first release is renamed on first launch.
 
 Settings → General has a **Database** section: change the file's path (to rename or move it — the current database is copied to the new location if nothing is there yet), or **Reveal in Finder / Explorer**. A custom path is remembered in `paths.json` in the data directory; `GHA_EXPLORER_DB` overrides it.
 
@@ -72,7 +85,7 @@ Settings → General has a **Database** section: change the file's path (to rena
 | `r` | Refresh (incremental sync) |
 | `R` | Full rescan (re-walk history back to repo creation) |
 | `s` | Switch repo (open picker) |
-| `f` | Collapse / expand the filter sidebar |
+| `f` | Collapse / expand the filter sidebar (or the `<` / `>` buttons at its foot) |
 | `n` | Open the notes manager (add / delete notes) |
 | `,` | Open Settings for the current repo (`Esc` / Close to return) |
 | `Esc` | Close an open note bubble |
@@ -84,8 +97,8 @@ Settings → General has a **Database** section: change the file's path (to rena
 
 The script is a single file (`gha_explorer.py`) — also packaged as the `gha-explorer` console script via `pyproject.toml` — with four layers:
 
-1. **Database (SQLite, WAL — `gha-explorer.db`)** — `run_jobs` stores the raw `gh run list` + `gh api runs/{id}/jobs` JSON per `run_id`, keyed by repo; `sync_meta` records per repo whether backfill has reached the repo's creation date; `settings` holds sticky UI state and per-repo config (global and per-repo scopes, JSON values); `notes` holds timestamped annotations per repo, each scoped to all jobs or a list of jobs. Never re-fetches the same run.
-2. **Fetch** — incremental sync: forward-fetch runs newer than the newest cached run, then backfill backwards in 90-day windows until the repo's creation date. Every list call walks past `gh run list`'s 1000-result cap by moving the upper date bound down and deduping, so busy windows don't silently drop runs. Once backfill completes it's skipped on later launches (`R` forces it).
+1. **Database (SQLite, WAL — `gha-explorer.db`)** — `run_jobs` stores the normalised run-list row + the raw `/actions/runs/{id}/jobs` JSON per `run_id`, keyed by repo; `sync_meta` records per repo whether backfill has reached the repo's creation date; `settings` holds sticky UI state and per-repo config (global and per-repo scopes, JSON values); `notes` holds timestamped annotations per repo, each scoped to all jobs or a list of jobs. Never re-fetches the same run.
+2. **Fetch** — GitHub REST API via stdlib `urllib` (no `gh` subprocesses): `/actions/runs` filtered by `status` and `created`, `/actions/runs/{id}/jobs`, `/user/repos`, `/rate_limit`. Incremental sync: forward-fetch runs newer than the newest cached run, then backfill backwards in 90-day windows until the repo's creation date. Every list call walks past the API's 1000-result cap by moving the upper date bound down and deduping, so busy windows don't silently drop runs. Once backfill completes it's skipped on later launches (`R` forces it). Auth is a token from `$GH_TOKEN`, `gh auth token`, or the in-app OAuth device flow (`resolve_token()`); a 401 mid-sync re-opens the sign-in dialog.
 3. **Aggregation** — stats (mean / median / min / max / stdev) and rolling averages for trend smoothing.
 4. **TUI (Textual + plotext)** — tabs with an inline sync status in the top bar, a filter sidebar inside the Trends/Runs tabs, ASCII charts, and a Status tab fed by a shared `SyncStats` object and an in-memory log handler. Charts plot one point per run, so notes are placed between the runs that bracket them, proportional to elapsed time; plotext draws the line and ⓘ, then the ⓘ is made clickable by attaching the note id as Rich style meta.
 
