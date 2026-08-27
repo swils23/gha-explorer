@@ -3956,7 +3956,7 @@ class GHAExplorerApp(App):
                 labels = []
                 values = []
                 for run in plot_runs:
-                    labels.append(run.created_at.strftime("%m/%d %H:%M"))
+                    labels.append(run.created_at.strftime("%Y-%m-%d"))
                     if is_pipeline:
                         values.append(run.total_duration_s / 60.0)
                     else:
