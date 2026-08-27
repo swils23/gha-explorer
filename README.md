@@ -16,7 +16,7 @@ A terminal UI for exploring GitHub Actions workflow timing data. Fetches success
 - **Filters** — by workflow, branch (top branches discovered from the data, multi-select), time range (1d / 1m / 3m / 6m / 1y / all, or a **Custom** from/through date range).
 - **Drag to zoom** — click and drag across the trend chart to zoom to that period; it becomes the Custom range (whole days, never finer) and is saved with your filters.
 - **Notes** — pin a note to a date/time ("switched runners", "enabled test cache"). It's drawn as a red vertical line on the trend charts with a clickable ⓘ that pops the note in a bubble, so you can eyeball before/after. A note applies to the job you're viewing by default, or to several jobs, or to all jobs (including ones that don't exist yet). Notes on jobs that later get grouped show on the group's chart prefixed with the source job. Each note has a colour (red by default). Manage them via `ⓘ Notes` at the right of the stats line or `n`; a note's bubble has Edit and Delete (with confirmation).
-- **Sticky state** — repo, active tab, sidebar collapsed, and per-repo filter selections (workflow, job, branches, time range, y-axis) are saved in SQLite and restored next launch.
+- **Sticky state** — repo, active tab, sidebar collapsed, and per-repo filter selections (workflow, job, branches, time range, y-axis) are saved in the database and restored next launch.
 - **Status tab** — live sync phase and progress, GitHub API rate-limit gauge, call/error counters, cache stats, and a streaming log.
 - **Resilient** — walks past `gh run list`'s 1000-result cap, handles rate limiting gracefully, and backfill resumes next launch.
 - **Dark lavender theme** — plus `--theme` to use any built-in Textual theme (charts recolor to match).
@@ -28,19 +28,25 @@ A terminal UI for exploring GitHub Actions workflow timing data. Fetches success
 
 ## Run
 
-No clone needed:
+No clone needed — it's on PyPI:
 
 ```bash
-uvx --from git+https://github.com/swils23/gha-explorer gha-explorer
-uvx --from git+https://github.com/swils23/gha-explorer gha-explorer --repo owner/name   # skip the picker
+uvx gha-explorer
+uvx gha-explorer --repo owner/name   # skip the picker
 ```
 
 Or install it as a tool so `gha-explorer` is on your PATH:
 
 ```bash
-uv tool install git+https://github.com/swils23/gha-explorer
+uv tool install gha-explorer
 gha-explorer --theme catppuccin-mocha   # any built-in Textual theme
-uv tool upgrade gha-explorer
+uv tool upgrade gha-explorer            # pick up new releases
+```
+
+To run the latest unreleased code straight from `main`, point `uvx` at the repo instead:
+
+```bash
+uvx --from git+https://github.com/swils23/gha-explorer gha-explorer
 ```
 
 From a checkout, the single file still runs directly (it carries inline script metadata):
@@ -53,7 +59,9 @@ First launch shows a repo picker listing every repo you have access to. Pick one
 
 ### Where data lives
 
-The cache, settings and log go in a per-user directory: `~/.local/share/gha-explorer` (or `$XDG_DATA_HOME/gha-explorer`; `%LOCALAPPDATA%\gha-explorer` on Windows). Set `GHA_EXPLORER_HOME` to put it somewhere else, and `gha-explorer --data-dir` prints the resolved path. A checkout that already has a `cache.db` next to the script keeps using it.
+Everything — the runs cache, settings and notes — lives in one SQLite file, `gha-explorer.db`, alongside the log in a per-user directory: `~/.local/share/gha-explorer` (or `$XDG_DATA_HOME/gha-explorer`; `%LOCALAPPDATA%\gha-explorer` on Windows). Set `GHA_EXPLORER_HOME` to put the directory somewhere else, and `gha-explorer --data-dir` prints the resolved path. A checkout that already has a database next to the script keeps using it, and a `cache.db` from before the first release is renamed on first launch.
+
+Settings → General has a **Database** section: change the file's path (to rename or move it — the current database is copied to the new location if nothing is there yet), or **Reveal in Finder / Explorer**. A custom path is remembered in `paths.json` in the data directory; `GHA_EXPLORER_DB` overrides it.
 
 ## Keybindings
 
@@ -75,7 +83,7 @@ The cache, settings and log go in a per-user directory: `~/.local/share/gha-expl
 
 The script is a single file (`gha_explorer.py`) — also packaged as the `gha-explorer` console script via `pyproject.toml` — with four layers:
 
-1. **Cache (SQLite, WAL)** — `run_jobs` stores the raw `gh run list` + `gh api runs/{id}/jobs` JSON per `run_id`, keyed by repo; `sync_meta` records per repo whether backfill has reached the repo's creation date; `settings` holds sticky UI state and per-repo config (global and per-repo scopes, JSON values); `notes` holds timestamped annotations per repo, each scoped to all jobs or a list of jobs. Never re-fetches the same run.
+1. **Database (SQLite, WAL — `gha-explorer.db`)** — `run_jobs` stores the raw `gh run list` + `gh api runs/{id}/jobs` JSON per `run_id`, keyed by repo; `sync_meta` records per repo whether backfill has reached the repo's creation date; `settings` holds sticky UI state and per-repo config (global and per-repo scopes, JSON values); `notes` holds timestamped annotations per repo, each scoped to all jobs or a list of jobs. Never re-fetches the same run.
 2. **Fetch** — incremental sync: forward-fetch runs newer than the newest cached run, then backfill backwards in 90-day windows until the repo's creation date. Every list call walks past `gh run list`'s 1000-result cap by moving the upper date bound down and deduping, so busy windows don't silently drop runs. Once backfill completes it's skipped on later launches (`R` forces it).
 3. **Aggregation** — stats (mean / median / min / max / stdev) and rolling averages for trend smoothing.
 4. **TUI (Textual + plotext)** — tabs with an inline sync status in the top bar, a filter sidebar inside the Trends/Runs tabs, ASCII charts, and a Status tab fed by a shared `SyncStats` object and an in-memory log handler. Charts plot one point per run, so notes are placed between the runs that bracket them, proportional to elapsed time; plotext draws the line and ⓘ, then the ⓘ is made clickable by attaching the note id as Rich style meta.

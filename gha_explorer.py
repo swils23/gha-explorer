@@ -11,7 +11,7 @@
 GHA Explorer — a TUI for exploring GitHub Actions workflow timing.
 
 Usage:
-    uvx --from git+https://github.com/swils23/gha-explorer gha-explorer [--repo owner/name] [--theme NAME]
+    uvx gha-explorer [--repo owner/name] [--theme NAME]
     # or from a checkout:  ./gha_explorer.py
 
 Incrementally fetches successful workflow runs for a repo (via the `gh` CLI),
@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -80,6 +81,10 @@ from textual.worker import Worker, WorkerState
 
 __version__ = "0.1.0"
 
+DB_FILENAME = "gha-explorer.db"      # runs cache + settings + notes
+LEGACY_DB_FILENAME = "cache.db"      # original (pre-release) name, renamed on first launch
+PATHS_FILENAME = "paths.json"        # {"db_path": ...} — can't live inside the DB it points at
+
 
 def data_dir() -> Path:
     """Per-user data directory.
@@ -95,7 +100,7 @@ def data_dir() -> Path:
     if env:
         return Path(env).expanduser()
     here = Path(__file__).resolve().parent
-    if (here / "cache.db").exists():
+    if (here / DB_FILENAME).exists() or (here / LEGACY_DB_FILENAME).exists():
         return here
     if sys.platform == "win32":
         base = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
@@ -106,6 +111,58 @@ def data_dir() -> Path:
 
 DATA_DIR = data_dir()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+PATHS_FILE = DATA_DIR / PATHS_FILENAME
+
+
+def _read_paths() -> dict:
+    try:
+        return json.loads(PATHS_FILE.read_text()) if PATHS_FILE.exists() else {}
+    except Exception:
+        return {}
+
+
+def resolve_db_path() -> Path:
+    """$GHA_EXPLORER_DB, else paths.json, else <data dir>/gha-explorer.db.
+
+    A pre-release cache.db in the data dir is renamed to the new name (with its
+    -wal/-shm siblings) the first time no gha-explorer.db exists.
+    """
+    env = os.environ.get("GHA_EXPLORER_DB")
+    if env:
+        return Path(env).expanduser()
+    stored = _read_paths().get("db_path")
+    if stored:
+        return Path(stored).expanduser()
+    default = DATA_DIR / DB_FILENAME
+    legacy = DATA_DIR / LEGACY_DB_FILENAME
+    if not default.exists() and legacy.exists():
+        for suffix in ("", "-wal", "-shm"):
+            src = Path(str(legacy) + suffix)
+            if src.exists():
+                src.rename(str(default) + suffix)
+    return default
+
+
+def set_db_path(path: Path) -> None:
+    """Remember a custom DB location and switch to it (connections reconnect lazily)."""
+    global CACHE_DB
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    PATHS_FILE.write_text(json.dumps({"db_path": str(path)}, indent=2))
+    CACHE_DB = path
+
+
+def reveal_in_file_manager(path: Path) -> None:
+    """Show the file in Finder / Explorer / the desktop's file manager."""
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", "-R", str(path)])
+    elif sys.platform == "win32":
+        subprocess.Popen(["explorer", f"/select,{path}"])
+    else:
+        subprocess.Popen(["xdg-open", str(path.parent)])
+
+
+FILE_MANAGER_NAME = {"darwin": "Finder", "win32": "Explorer"}.get(sys.platform, "file manager")
 
 # ---------------------------------------------------------------------------
 # Logging — file (DEBUG) + in-memory ring buffer (INFO) drained by the UI
@@ -301,7 +358,7 @@ TIME_RANGES: dict[str, timedelta | None] = {
     "all": None,
 }
 
-CACHE_DB = DATA_DIR / "cache.db"
+CACHE_DB = resolve_db_path()
 CONFIG_FILE = DATA_DIR / "config.json"  # legacy; imported into the settings table once
 
 _db_local = threading.local()
@@ -355,14 +412,46 @@ def _init_schema(conn: sqlite3.Connection) -> None:
 
 
 def _cache_conn() -> sqlite3.Connection:
-    """One connection per thread, WAL mode, schema ensured once per connection."""
+    """One connection per thread, WAL mode, schema ensured once per connection.
+    Reconnects if the DB path changed since this thread last connected."""
     conn = getattr(_db_local, "conn", None)
+    if conn is not None and getattr(_db_local, "path", None) != str(CACHE_DB):
+        try:
+            conn.close()
+        except Exception:
+            pass
+        conn = None
     if conn is None:
+        CACHE_DB.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(CACHE_DB), timeout=30)
         conn.execute("PRAGMA journal_mode=WAL")
         _init_schema(conn)
         _db_local.conn = conn
+        _db_local.path = str(CACHE_DB)
     return conn
+
+
+def switch_db(new_path: Path) -> str:
+    """Point the app at another DB file. If it doesn't exist yet, the current DB is
+    copied there (after a WAL checkpoint) so renaming/moving is painless. The old
+    file is left in place. Returns a short description of what happened."""
+    new_path = new_path.expanduser()
+    if new_path.exists() and new_path.resolve() == CACHE_DB.resolve():
+        return "Already using that database."
+    copied = False
+    if not new_path.exists() and CACHE_DB.exists():
+        try:
+            _cache_conn().execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            log.debug("checkpoint before copy failed", exc_info=True)
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(CACHE_DB, new_path)
+        copied = True
+    old = CACHE_DB
+    set_db_path(new_path)
+    log.info("Switched database %s -> %s (%s)", old, new_path, "copied" if copied else "existing file")
+    return (f"Copied the current database to {new_path} and switched to it. The old file at {old} was left in place."
+            if copied else f"Switched to the existing database at {new_path}.")
 
 
 def cache_get_jobs(run_id: int) -> tuple[dict, list[dict]] | None:
@@ -788,7 +877,7 @@ class RepoConfig:
     # unless outlier_both is set.
     outlier_filter: bool = False
     outlier_k: float = 3.0
-    outlier_window: int = 15
+    outlier_window: int = 41
     outlier_both: bool = False
 
     @property
@@ -828,7 +917,9 @@ class RepoConfig:
             rolling_window=window,
             outlier_filter=bool(data.get("outlier_filter", False)),
             outlier_k=_num("outlier_k", 3.0, 1.0, 20.0, float),
-            outlier_window=_num("outlier_window", 15, 5, 201, int),
+            # 15 was the original default and is too small to catch a cluster of slow
+            # runs (a median filter only sees clusters shorter than half its window)
+            outlier_window=41 if data.get("outlier_window") == 15 else _num("outlier_window", 41, 5, 201, int),
             outlier_both=bool(data.get("outlier_both", False)),
         )
 
@@ -1232,21 +1323,32 @@ def hampel_outliers(values: list[float], window: int = 15, k: float = 3.0, both:
     while a sustained level shift (e.g. a permanent 90% speed-up) is not — the
     median moves with the data. Only the few points straddling a shift can be
     misjudged, bounded by half the window.
+
+    A cluster of consecutive bad runs (a GitHub incident) is only visible if it is
+    shorter than half the window, so the window should be generous. A second pass
+    recomputes each run's reference from its *unflagged* neighbours, so a cluster
+    that was only partly caught in the first pass doesn't shield its remaining
+    members.
     """
     n = len(values)
     flags = [False] * n
     if n < 5:
         return flags
     half = max(2, window // 2)
-    for i in range(n):
-        win = values[max(0, i - half):min(n, i + half + 1)]
+
+    def is_outlier(i: int, exclude: list[bool]) -> bool:
+        lo, hi = max(0, i - half), min(n, i + half + 1)
+        win = [values[j] for j in range(lo, hi) if not exclude[j] or j == i]
+        if len(win) < 5:
+            win = values[lo:hi]
         m = median(win)
         mad = median(abs(v - m) for v in win)
         scale = max(1.4826 * mad, 0.05 * m, 5.0)
         dev = values[i] - m
-        if dev > k * scale or (both and -dev > k * scale):
-            flags[i] = True
-    return flags
+        return dev > k * scale or (both and -dev > k * scale)
+
+    first = [is_outlier(i, flags) for i in range(n)]
+    return [first[i] or is_outlier(i, first) for i in range(n)]
 
 
 # ---------------------------------------------------------------------------
@@ -2016,6 +2118,19 @@ class SettingsScreen(Screen[bool]):
         padding: 0;
         margin-bottom: 1;
     }
+    #db-row {
+        height: 3;
+    }
+    #general #db-path {
+        width: 1fr;
+        margin-right: 1;
+    }
+    #db-row Button {
+        margin-right: 1;
+    }
+    #db-status {
+        color: $success;
+    }
     #group-members {
         height: 2fr;
         min-height: 5;
@@ -2056,6 +2171,7 @@ class SettingsScreen(Screen[bool]):
         self.raw_runs = runs
         self.cfg = RepoConfig.from_json(cfg.to_json())  # work on a copy
         self.changed = False
+        self.db_changed = False
         self._editing: str | None = None  # group currently loaded in the editor
 
     # -- layout --
@@ -2071,7 +2187,7 @@ class SettingsScreen(Screen[bool]):
         with ContentSwitcher(initial="general", id="settings-content"):
             with Vertical(id="general"):
                 yield Static(
-                    "Settings apply to this repository only and are saved to cache.db as you change them.",
+                    "Settings apply to this repository only and are saved to the database as you change them.",
                     classes="settings-hint",
                 )
                 with Horizontal(id="general-row"):
@@ -2093,8 +2209,22 @@ class SettingsScreen(Screen[bool]):
                     "Hampel filter: a run is hidden when it is more than k robust deviations (median absolute "
                     "deviation) away from the median of the surrounding window. Transient spikes — a flaky runner, "
                     "a stuck queue — get hidden; a lasting change in duration moves the local median with it and "
-                    "stays visible. Lower k = more aggressive; 3 is a common default. Hidden runs still count in "
-                    "the Runs tab.",
+                    "stays visible. Lower k = more aggressive; 3 is a common default. The window must be more than "
+                    "twice the longest streak of bad runs you want to catch (an incident slowing 10 runs in a row "
+                    "needs a window over 20); 41 is a good default. Hidden runs still count in the Runs tab.",
+                    classes="settings-hint",
+                )
+                yield Label("Database", classes="settings-heading")
+                with Horizontal(id="db-row"):
+                    yield Input(value=str(CACHE_DB), id="db-path")
+                    yield Button("Apply path", id="db-apply", variant="primary")
+                    yield Button(f"Reveal in {FILE_MANAGER_NAME}", id="db-reveal")
+                yield Static("", id="db-status", classes="settings-hint")
+                yield Static(
+                    "Runs cache, settings and notes all live in this one SQLite file. Change the path to rename or "
+                    "move it: if nothing exists at the new path the current database is copied there first; the old "
+                    "file is not deleted. The location is remembered in paths.json in the data directory "
+                    "(or set GHA_EXPLORER_DB).",
                     classes="settings-hint",
                 )
             with Vertical(id="groups"):
@@ -2315,6 +2445,38 @@ class SettingsScreen(Screen[bool]):
         if 5 <= value <= 201 and value != self.cfg.outlier_window:
             self.cfg.outlier_window = value
             self._save()
+
+    @on(Button.Pressed, "#db-reveal")
+    def _reveal_db(self) -> None:
+        try:
+            reveal_in_file_manager(CACHE_DB)
+        except Exception as exc:
+            self.query_one("#db-status", Static).update(f"Couldn't open {FILE_MANAGER_NAME}: {exc}")
+
+    @on(Button.Pressed, "#db-apply")
+    @on(Input.Submitted, "#db-path")
+    def _apply_db_path(self) -> None:
+        status = self.query_one("#db-status", Static)
+        raw = self.query_one("#db-path", Input).value.strip()
+        if not raw:
+            status.update("Enter a path for the database file")
+            return
+        new_path = Path(raw).expanduser()
+        if new_path.is_dir():
+            new_path = new_path / DB_FILENAME
+        if getattr(self.app, "loading", False):
+            status.update("A sync is running — wait for it to finish before switching databases")
+            return
+        try:
+            message = switch_db(new_path)
+        except Exception as exc:
+            log.exception("Switching database failed")
+            status.update(f"Couldn't switch: {exc}")
+            return
+        self.query_one("#db-path", Input).value = str(CACHE_DB)
+        status.update(message)
+        self.db_changed = True
+        self.changed = True
 
     @on(DataTable.RowSelected, "#workflows-table")
     @on(DataTable.RowSelected, "#jobs-table")
@@ -2947,6 +3109,7 @@ class GHAExplorerApp(App):
         self._notes: list[Note] = []
         self._config = RepoConfig()
         self._view_runs: list[RunData] = []
+        self._last_settings_screen: SettingsScreen | None = None
         self._log_count = 0
         self.register_theme(GHA_THEME)
         self.theme = theme_name or GHA_THEME.name
@@ -3208,7 +3371,7 @@ class GHAExplorerApp(App):
                     cache_details.append(f"All repos:     {c['total_rows']:,} runs / {c['repos']} repos\n")
                     cache_details.append(f"Notes:         {c['notes']}\n")
                     cache_details.append(f"DB size:       {fmt_bytes(c['db_bytes'])}\n")
-                    cache_details.append(f"Data dir:      {DATA_DIR}", style=p.muted_hex)
+                    cache_details.append(f"Database:      {CACHE_DB}", style=p.muted_hex)
                 except Exception:
                     log.debug("cache summary failed", exc_info=True)
                     cache_details.append("unavailable", style=p.muted_hex)
@@ -3328,10 +3491,17 @@ class GHAExplorerApp(App):
             self.notify("Select a repository first.", severity="warning")
             return
         self.action_close_bubbles()
-        self.push_screen(SettingsScreen(self.current_repo, self.runs, self._config), self._on_settings_closed)
+        self._last_settings_screen = SettingsScreen(self.current_repo, self.runs, self._config)
+        self.push_screen(self._last_settings_screen, self._on_settings_closed)
 
     def _on_settings_closed(self, changed: bool | None) -> None:
         if not changed:
+            return
+        screen = self._last_settings_screen
+        if screen is not None and screen.db_changed:
+            # New database file: reload everything for the current repo from it
+            self.notify(f"Using database {CACHE_DB}", timeout=5)
+            self._use_repo(self.current_repo)
             return
         self._config = load_repo_config(self.current_repo)
         self._view_runs = apply_repo_config(self.runs, self._config)
@@ -3903,6 +4073,12 @@ def main():
     if args.data_dir:
         print(DATA_DIR)
         return
+
+    if shutil.which("gh") is None:
+        sys.exit(
+            "gha-explorer needs the GitHub CLI (`gh`) on your PATH, but it wasn't found.\n"
+            "Install it from https://cli.github.com/ and then run `gh auth login`."
+        )
 
     log.info("=" * 60)
     log.info("Starting GHA Explorer %s (data dir: %s)", __version__, DATA_DIR)

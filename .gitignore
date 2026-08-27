@@ -1,4 +1,10 @@
-# Local cache DB — can be rebuilt from the GitHub API
+# Local database (runs cache + settings + notes) and its pointer file
+gha-explorer.db
+gha-explorer.db-journal
+gha-explorer.db-wal
+gha-explorer.db-shm
+paths.json
+# pre-release name
 cache.db
 cache.db-journal
 cache.db-wal
