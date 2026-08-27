@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "textual>=8.0,<9",
-#     "plotext>=5.3.2,<6",
+#     "plotext>=6.0.0,<7",
 #     "rich>=13.0.0",
 # ]
 # ///
@@ -1359,24 +1359,86 @@ def hampel_outliers(values: list[float], window: int = 15, k: float = 3.0, both:
 _plot_lock = threading.Lock()
 
 
-def render_plot(plot_func, width: int, height: int, palette: PlotPalette) -> RichText:
-    """Render a plotext chart to a Rich Text object (ANSI colors preserved).
+_ANSI_BACKGROUND = re.compile(r"\x1b\[48;(?:5;\d+|2;\d+;\d+;\d+)m")
 
-    Uses plotext's transparent "clear" theme so the chart sits on the Textual
-    background, with axes/ticks in the theme's muted color.
+
+class Chart:
+    """The handful of chart operations we use, on top of plotext 6's figure API.
+
+    plotext 6 is a single global figure object (``plotext.figure``) driven by
+    signals and pixels; this wraps it so the chart code reads like a plotting
+    API and the plotext specifics live in one place. Colours are RGB tuples.
+    """
+
+    def __init__(self, width: int, height: int, palette: PlotPalette) -> None:
+        import plotext as plt
+
+        self._plt = plt
+        self._fig = fig = plt.figure
+        fig.clear()
+        plt.terminal.limit(False, False)  # Textual knows the real size; plotext's tty probe may not
+        fig.plot_size(width, height)
+        fig.theme("colorless")
+        fig.canvas("default")
+        self._frame = plt.pixel(palette.axes)
+        fig.axes(pixel=self._frame)
+        fig.ruler("both").pixel(self._frame)
+        fig.legend(active=False)  # plotext 6 draws a boxed legend over the data; we add our own line
+        self.legend: list[tuple[str, tuple[int, int, int]]] = []
+
+    def plot(self, xs: list, ys: list, color: tuple[int, int, int], label: str | None = None) -> None:
+        """Braille line through the points."""
+        signal = self._fig.signal(xs, ys, marker=self._plt.marker("braille", self._plt.pixel(color)))
+        signal.lines(True)
+        if label:
+            self.legend.append((label, color))
+        self._fig.draw(signal)
+
+    def bar(self, labels: list[str], values: list[float], color: tuple[int, int, int]) -> None:
+        self._fig.draw(self._fig.bar(labels, values, marker=self._plt.marker("full", self._plt.pixel(color))))
+
+    def vline(self, x: float, color: tuple[int, int, int]) -> None:
+        self._fig.line(x, orientation="vertical", pixel=self._plt.pixel(color))
+
+    def text(self, label: str, x: float, y: float, color: tuple[int, int, int]) -> None:
+        self._fig.draw(self._fig.text(x, y, self._plt.colorize(label, self._plt.pixel(color))))
+
+    def xticks(self, positions: list, labels: list[str]) -> None:
+        self._fig.ruler("x").ticks(positions, labels)
+
+    def ylim(self, lower: float, upper: float) -> None:
+        self._fig.ruler("y").lim(lower, upper)
+
+    def title(self, label: str) -> None:
+        self._fig.title(self._plt.colorize(label, self._frame))
+
+    def ylabel(self, label: str) -> None:
+        self._fig.label(self._plt.colorize(label, self._frame), axis="y")
+
+    def build(self) -> str:
+        # plotext 6 back-fills axis/ruler backgrounds from its package default (white)
+        # and offers no transparent value, so drop background codes: the chart sits
+        # on the Textual background.
+        out = _ANSI_BACKGROUND.sub("", self._fig.build().string())
+        if self.legend:
+            # One compact legend line under the title (row 0), like plotext 5's inline legend
+            entries = "  ".join(f"\x1b[38;2;{r};{g};{b}m━━ {label}\x1b[0m" for label, (r, g, b) in self.legend)
+            lines = out.split("\n")
+            lines.insert(1, "     " + entries)
+            out = "\n".join(lines)
+        return out
+
+
+def render_plot(plot_func, width: int, height: int, palette: PlotPalette) -> RichText:
+    """Render a chart to a Rich Text object (ANSI colors preserved).
+
+    `plot_func` receives a `Chart`. plotext's figure is a process-wide singleton,
+    hence the lock.
     """
     with _plot_lock:
-        import plotext as plt
-        plt.clear_figure()
-        plt.clear_data()
-        plt.theme("clear")
-        plt.limit_size(False, False)  # Textual knows the real width; plotext's tty probe may not
-        plt.canvas_color("default")
-        plt.axes_color("default")
-        plt.ticks_color(palette.axes)
-        plt.plotsize(width, height)
-        plot_func(plt)
-        return RichText.from_ansi(plt.build())
+        chart = Chart(width, height, palette)
+        plot_func(chart)
+        return RichText.from_ansi(chart.build())
 
 
 # ---------------------------------------------------------------------------
@@ -2629,13 +2691,15 @@ class ChartGeometry:
 
 def chart_geometry(text: RichText, points: int) -> ChartGeometry | None:
     lines = [line.plain for line in text.split("\n")]
+    # The frame's top-left corner is the first ┌; the x axis is the *last* line with a
+    # └ (the legend box, drawn inside the canvas, has corners of its own).
     top = next((i for i, l in enumerate(lines) if "┌" in l), None)
-    bottom = next((i for i, l in enumerate(lines) if "└" in l), None)
+    bottom = next((i for i in range(len(lines) - 1, -1, -1) if "└" in lines[i]), None)
     if top is None or bottom is None or points < 2:
         return None
     axis = lines[bottom]
     left = axis.index("└") + 1
-    right = axis.index("┘") - 1 if "┘" in axis else len(axis) - 1
+    right = axis.rindex("┘") - 1 if "┘" in axis else len(axis) - 1
     if right <= left:
         return None
     return ChartGeometry(top, bottom, left, right, points)
@@ -3884,8 +3948,8 @@ class GHAExplorerApp(App):
         def draw_notes(plt, y_top: float) -> None:
             for x, note in positioned:
                 rgb = _hex_to_rgb(note.color) if note.color else note_rgb
-                plt.vline(x, color=rgb)
-                plt.text(NOTE_MARKER, x=x, y=y_top, color=rgb)
+                plt.vline(x, rgb)
+                plt.text(NOTE_MARKER, x, y_top, rgb)
 
         try:
             def plot_trend(plt):
@@ -3901,11 +3965,11 @@ class GHAExplorerApp(App):
                     plt.title(f"No data for {job_name}")
                     return
                 xs = list(range(len(values)))
-                plt.plot(xs, values, marker="braille", color=p.series[0], label="duration")
+                plt.plot(xs, values, p.series[0], label="duration")
                 window = self._config.rolling_window
                 if len(values) >= max(3, window):
                     rolling = [mean(values[max(0, i - window + 1):i + 1]) for i in range(len(values))]
-                    plt.plot(xs, rolling, marker="braille", color=p.series[1], label="rolling avg")
+                    plt.plot(xs, rolling, p.series[1], label="rolling avg")
                 n = len(labels)
                 if n > 10:
                     step = max(1, n // 8)
@@ -3962,11 +4026,7 @@ class GHAExplorerApp(App):
                             window = max(self._config.rolling_window, len(ys) // 40)
                             ys = [mean(ys[max(0, i - window + 1):i + 1]) for i in range(len(ys))]
                         all_ys_max = max(all_ys_max, max(ys))
-                        plt.plot(
-                            list(range(len(ys))), ys,
-                            marker="braille", color=p.series[ci % len(p.series)],
-                            label=key,
-                        )
+                        plt.plot(list(range(len(ys))), ys, p.series[ci % len(p.series)], label=key)
                     top = all_ys_max
                     if self._y_starts_zero() and all_ys_max > 0:
                         top = all_ys_max * 1.05
@@ -3992,7 +4052,7 @@ class GHAExplorerApp(App):
                 parts.append("")
 
                 def plot_steps(plt):
-                    plt.bar([n[:40] for n, _ in step_avgs], [a for _, a in step_avgs], color=p.series[0])
+                    plt.bar([n[:40] for n, _ in step_avgs], [a for _, a in step_avgs], p.series[0])
                     if self._y_starts_zero():
                         plt.ylim(0, max(a for _, a in step_avgs) * 1.05)
                     plt.title(f"{job_name} — Avg Step Durations (seconds)")

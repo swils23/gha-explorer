@@ -8,7 +8,7 @@ license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "textual>=8.0,<9",
-    "plotext>=5.3.2,<6",
+    "plotext>=6.0.0,<7",
     "rich>=13.0.0",
 ]
 keywords = ["github-actions", "ci", "tui", "textual"]

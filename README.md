@@ -24,6 +24,7 @@ A terminal UI for exploring GitHub Actions workflow timing data. Fetches success
 ## Requirements
 
 - [`uv`](https://github.com/astral-sh/uv) — provides `uvx`; it fetches Python 3.11+ and the dependencies for you
+- Charts use [plotext 6](https://pypi.org/project/plotext/), which ships compiled wheels for macOS (Intel/Apple silicon), Linux (x86_64/aarch64) and Windows x86_64; other platforms need a C compiler to build it
 - [`gh`](https://cli.github.com/) — GitHub CLI, authenticated (`gh auth login`)
 
 ## Run
