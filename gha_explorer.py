@@ -3713,6 +3713,7 @@ class GHAExplorerApp(App):
         if key == self.selected_timerange:
             return
         self.selected_timerange = key
+        self._custom_range = None  # picking a preset resets the Custom button
         self._populate_sidebar()
         self._save_filters()
         self._render_all_tabs()
