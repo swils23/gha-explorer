@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -1073,6 +1074,74 @@ def notes_delete(note_id: int) -> None:
         conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
 
 
+def time_to_x(times: list[datetime], t: datetime) -> float | None:
+    """Map a moment onto the chart's x axis: days since the first plotted run.
+    None if outside the plotted range. The axis is proportional to time, so
+    equal widths mean equal elapsed time regardless of how many runs happened."""
+    if not times or t < times[0] or t > times[-1]:
+        return None
+    return (t - times[0]).total_seconds() / 86400
+
+
+def x_span_days(times: list[datetime]) -> float:
+    """Width of the x axis in days (never zero, so a single run still plots)."""
+    if len(times) < 2:
+        return 1 / 24
+    return max((times[-1] - times[0]).total_seconds() / 86400, 1 / 24)
+
+
+TICK_STEPS_DAYS = (1, 2, 7, 14, 30, 60, 90, 180, 365, 730)
+
+
+def nice_yticks(lo: float, hi: float, target: int = 6) -> tuple[list[float], list[str]]:
+    """Round y ticks: a 1/2/5 x 10^n step giving about `target` ticks over [lo, hi].
+    Labels drop decimals once the step is a whole unit (so a 10+ minute scale reads
+    13, 14, 15 ... rather than 13.2, 14.7), and keep one decimal below that."""
+    if hi <= lo:
+        hi = lo + 1
+    raw = (hi - lo) / max(1, target)
+    magnitude = 10 ** math.floor(math.log10(raw)) if raw > 0 else 1
+    step = next((m * magnitude for m in (1, 2, 5, 10) if m * magnitude >= raw), 10 * magnitude)
+    step = max(step, 0.1)
+    start = math.ceil(lo / step) * step
+    positions = []
+    v = start
+    while v <= hi + 1e-9:
+        positions.append(round(v, 6))
+        v += step
+    decimals = 0 if step >= 1 else 1
+    return positions, [f"{p:.{decimals}f}" for p in positions]
+
+
+def date_ticks(times: list[datetime], max_ticks: int = 8) -> tuple[list[float], list[str]]:
+    """Ticks at evenly spaced calendar dates (not every N-th run, which bunches
+    up on busy days). The first and last dates plotted are always labelled; the
+    interior steps use the smallest day step from TICK_STEPS_DAYS that yields
+    <= max_ticks, and any interior tick close enough to an end label to collide
+    with it is dropped."""
+    if not times:
+        return [], []
+    first, last = times[0], times[-1]
+    if len(times) < 2 or first.date() == last.date():
+        return [0.0], [first.strftime("%Y-%m-%d")]
+    span_days = max(1, (last.date() - first.date()).days)
+    step = next((d for d in TICK_STEPS_DAYS if span_days / d <= max_ticks), TICK_STEPS_DAYS[-1])
+    x_last = time_to_x(times, last) or 0.0
+    positions: list[float] = [0.0]
+    labels: list[str] = [first.strftime("%Y-%m-%d")]
+    day = datetime.combine(first.date(), datetime.min.time(), tzinfo=first.tzinfo) + timedelta(days=step)
+    guard = 0.6 * step  # roughly one label width at this tick density
+    while day < last:
+        x = time_to_x(times, day)
+        if x is not None and x > guard and x < x_last - guard:
+            positions.append(x)
+            labels.append(day.strftime("%Y-%m-%d"))
+        day += timedelta(days=step)
+    positions.append(x_last)
+    labels.append(last.strftime("%Y-%m-%d"))
+    return positions, labels
+
+
 def note_x_positions(runs: list[RunData], notes: list[Note]) -> list[tuple[float, Note]]:
     """Map note timestamps onto the chart's run-index x axis.
 
@@ -1080,22 +1149,12 @@ def note_x_positions(runs: list[RunData], notes: list[Note]) -> list[tuple[float
     lands between the runs that bracket it, proportionally to elapsed time.
     Notes outside the plotted range are skipped. `runs` must be sorted by time.
     """
-    if len(runs) < 2:
-        return []
     times = [r.created_at for r in runs]
     out: list[tuple[float, Note]] = []
     for n in notes:
-        if n.at < times[0] or n.at > times[-1]:
-            continue
-        i = bisect_left(times, n.at)
-        if i == 0:
-            x = 0.0
-        else:
-            t0, t1 = times[i - 1], times[i]
-            span = (t1 - t0).total_seconds()
-            frac = (n.at - t0).total_seconds() / span if span > 0 else 0.0
-            x = (i - 1) + frac
-        out.append((x, n))
+        x = time_to_x(times, n.at)
+        if x is not None:
+            out.append((x, n))
     out.sort(key=lambda t: t[0])
     return out
 
@@ -1687,6 +1746,25 @@ class Chart:
 
     def ylim(self, lower: float, upper: float) -> None:
         self._fig.ruler("y").lim(lower, upper)
+
+    def xlim(self, lower: float, upper: float) -> None:
+        self._fig.ruler("x").lim(lower, upper)
+
+    def yticks(self, positions: list[float], labels: list[str]) -> None:
+        self._fig.ruler("y").ticks(positions, labels)
+
+    def yaxis(self, values: list[float], from_zero: bool) -> float:
+        """Fix the y range for `values` (optionally from 0) with rounded tick labels.
+        Returns the top of the range (where note markers go)."""
+        hi = max(values) if values else 1.0
+        lo = 0.0 if from_zero else min(values)
+        if from_zero:
+            hi *= 1.05
+        if hi <= lo:
+            hi = lo + 1
+        self.ylim(lo, hi)
+        self.yticks(*nice_yticks(lo, hi))
+        return hi
 
     def title(self, label: str) -> None:
         self._fig.title(self._plt.colorize(label, self._frame))
@@ -3247,28 +3325,27 @@ class ChartGeometry:
     bottom: int   # row of the bottom axis
     left: int     # first canvas column
     right: int    # last canvas column
-    points: int   # number of x positions (runs)
 
-    def col_to_index(self, col: int) -> int:
+    def col_to_fraction(self, col: int) -> float:
+        """0.0 at the left edge of the canvas, 1.0 at the right (the x axis is time)."""
         span = max(1, self.right - self.left)
-        frac = (min(max(col, self.left), self.right) - self.left) / span
-        return int(round(frac * (self.points - 1)))
+        return (min(max(col, self.left), self.right) - self.left) / span
 
 
-def chart_geometry(text: RichText, points: int) -> ChartGeometry | None:
+def chart_geometry(text: RichText) -> ChartGeometry | None:
     lines = [line.plain for line in text.split("\n")]
     # The frame's top-left corner is the first ┌; the x axis is the *last* line with a
     # └ (the legend box, drawn inside the canvas, has corners of its own).
     top = next((i for i, l in enumerate(lines) if "┌" in l), None)
     bottom = next((i for i in range(len(lines) - 1, -1, -1) if "└" in lines[i]), None)
-    if top is None or bottom is None or points < 2:
+    if top is None or bottom is None:
         return None
     axis = lines[bottom]
     left = axis.index("└") + 1
     right = axis.rindex("┘") - 1 if "┘" in axis else len(axis) - 1
     if right <= left:
         return None
-    return ChartGeometry(top, bottom, left, right, points)
+    return ChartGeometry(top, bottom, left, right)
 
 
 class TrendChart(Static):
@@ -3277,10 +3354,10 @@ class TrendChart(Static):
     release, a ZoomSelected message carries the two run indices."""
 
     class ZoomSelected(Message):
-        def __init__(self, start_index: int, end_index: int) -> None:
+        def __init__(self, start_fraction: float, end_fraction: float) -> None:
             super().__init__()
-            self.start_index = start_index
-            self.end_index = end_index
+            self.start_fraction = start_fraction
+            self.end_fraction = end_fraction
 
     def __init__(self, **kwargs) -> None:
         super().__init__("", **kwargs)
@@ -3326,8 +3403,8 @@ class TrendChart(Static):
         self._drag_start = self._drag_cur = None
         self.update(RichGroup(*self._parts))
         if self._geom and abs(end - start) >= 1:
-            i0, i1 = sorted((self._geom.col_to_index(start), self._geom.col_to_index(end)))
-            self.post_message(self.ZoomSelected(i0, i1))
+            f0, f1 = sorted((self._geom.col_to_fraction(start), self._geom.col_to_fraction(end)))
+            self.post_message(self.ZoomSelected(f0, f1))
 
     def _render_drag(self) -> None:
         g = self._geom
@@ -4201,9 +4278,10 @@ class GHAExplorerApp(App):
         dates = self._plot_run_dates
         if not dates:
             return
-        i0 = max(0, min(message.start_index, len(dates) - 1))
-        i1 = max(0, min(message.end_index, len(dates) - 1))
-        self._apply_custom_range(dates[i0].date(), dates[i1].date())
+        t0, span = dates[0], timedelta(days=x_span_days(dates))
+        start = (t0 + span * message.start_fraction).date()
+        end = (t0 + span * message.end_fraction).date()
+        self._apply_custom_range(start, end)
 
     # -- Settings --
 
@@ -4618,10 +4696,8 @@ class GHAExplorerApp(App):
 
         try:
             def plot_trend(plt):
-                labels = []
                 values = []
                 for run in plot_runs:
-                    labels.append(run.created_at.strftime("%Y-%m-%d"))
                     if is_pipeline:
                         values.append(run.total_duration_s / 60.0)
                     else:
@@ -4629,29 +4705,21 @@ class GHAExplorerApp(App):
                 if not values:
                     plt.title(f"No data for {job_name}")
                     return
-                xs = list(range(len(values)))
+                xs = [time_to_x(self._plot_run_dates, r.created_at) or 0.0 for r in plot_runs]
+                plt.xlim(0, x_span_days(self._plot_run_dates))
                 plt.plot(xs, values, p.series[0], label="duration")
                 window = self._config.rolling_window
                 if len(values) >= max(3, window):
                     rolling = [mean(values[max(0, i - window + 1):i + 1]) for i in range(len(values))]
                     plt.plot(xs, rolling, p.series[1], label="rolling avg")
-                n = len(labels)
-                if n > 10:
-                    step = max(1, n // 8)
-                    ticks = list(range(0, n, step))
-                    plt.xticks(ticks, [labels[i] for i in ticks])
-                else:
-                    plt.xticks(xs, labels)
-                top = max(values)
-                if self._y_starts_zero():
-                    top = max(values) * 1.05
-                    plt.ylim(0, top)
+                plt.xticks(*date_ticks(self._plot_run_dates))
+                top = plt.yaxis(values, self._y_starts_zero())
                 draw_notes(plt, top)
                 plt.title(f"{job_name} Duration Trend (minutes)")
                 plt.ylabel("Minutes")
 
             chart = render_plot(plot_trend, w, self._plot_height(0.5), p)
-            geom = chart_geometry(chart, len(plot_runs))
+            geom = chart_geometry(chart)
             parts.append(attach_note_markers(chart, [n for _, n in positioned], p.error_hex))
         except Exception:
             log.exception("Error rendering trend plot for %s", job_name)
@@ -4679,7 +4747,9 @@ class GHAExplorerApp(App):
                         key=_shard_sort_key,
                     )
                     runs_with_job = plot_runs
-                    all_ys_max = 0.0
+                    member_xs = [time_to_x(self._plot_run_dates, r.created_at) or 0.0 for r in runs_with_job]
+                    plt.xlim(0, x_span_days(self._plot_run_dates))
+                    all_ys: list[float] = []
                     for ci, key in enumerate(shard_keys):
                         ys = []
                         for r in runs_with_job:
@@ -4690,12 +4760,10 @@ class GHAExplorerApp(App):
                         if len(ys) >= 5:
                             window = max(self._config.rolling_window, len(ys) // 40)
                             ys = [mean(ys[max(0, i - window + 1):i + 1]) for i in range(len(ys))]
-                        all_ys_max = max(all_ys_max, max(ys))
-                        plt.plot(list(range(len(ys))), ys, p.series[ci % len(p.series)], label=key)
-                    top = all_ys_max
-                    if self._y_starts_zero() and all_ys_max > 0:
-                        top = all_ys_max * 1.05
-                        plt.ylim(0, top)
+                        all_ys.extend(ys)
+                        plt.plot(member_xs, ys, p.series[ci % len(p.series)], label=key)
+                    plt.xticks(*date_ticks(self._plot_run_dates))
+                    top = plt.yaxis(all_ys, self._y_starts_zero()) if all_ys else 1.0
                     draw_notes(plt, top)
                     plt.title(f"{job_name} — Group Members (minutes, rolling avg)")
                     plt.ylabel("Minutes")
@@ -4718,8 +4786,7 @@ class GHAExplorerApp(App):
 
                 def plot_steps(plt):
                     plt.bar([n[:40] for n, _ in step_avgs], [a for _, a in step_avgs], p.series[0])
-                    if self._y_starts_zero():
-                        plt.ylim(0, max(a for _, a in step_avgs) * 1.05)
+                    plt.yaxis([a for _, a in step_avgs], from_zero=True)
                     plt.title(f"{job_name} — Avg Step Durations (seconds)")
                     plt.ylabel("Seconds")
 
