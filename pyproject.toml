@@ -1,9 +1,10 @@
 [project]
 name = "gha-explorer"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A terminal UI for exploring GitHub Actions workflow timing trends"
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "textual>=8.0,<9",
@@ -13,19 +14,31 @@ dependencies = [
 keywords = ["github-actions", "ci", "tui", "textual"]
 classifiers = [
     "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Build Tools",
 ]
 
 [project.urls]
 Homepage = "https://github.com/swils23/gha-explorer"
+Repository = "https://github.com/swils23/gha-explorer"
+Issues = "https://github.com/swils23/gha-explorer/issues"
 
 [project.scripts]
 gha-explorer = "gha_explorer:main"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "gha_explorer.py"
 
 [tool.hatch.build.targets.wheel]
 only-include = ["gha_explorer.py"]

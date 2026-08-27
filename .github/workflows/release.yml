@@ -1,0 +1,83 @@
+# Publishes gha-explorer to PyPI via trusted publishing (OIDC — no stored token).
+#
+# One-time setup on https://pypi.org/manage/account/publishing/ (and the same on
+# test.pypi.org): add a "pending publisher" for owner `swils23`, repository
+# `gha-explorer`, workflow `release.yml`, environment `pypi` (or `testpypi`).
+#
+# Release: bump __version__ in gha_explorer.py, commit, then
+#     git tag v0.1.0 && git push origin v0.1.0
+# Rehearse on TestPyPI first from the Actions tab (Run workflow → target: testpypi).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Where to publish
+        type: choice
+        options: [testpypi, pypi]
+        default: testpypi
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Check the tag matches __version__
+        if: github.ref_type == 'tag'
+        run: |
+          version="$(sed -nE 's/^__version__ = "([^"]+)"/\1/p' gha_explorer.py)"
+          if [ "v$version" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match __version__ = $version"
+            exit 1
+          fi
+      - run: uv build
+      - name: Smoke-test the wheel
+        run: uvx --from dist/*.whl gha-explorer --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event_name == 'workflow_dispatch' && inputs.target || 'pypi' }}
+    permissions:
+      id-token: write   # trusted publishing
+    steps:
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Publish to TestPyPI
+        if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
+        run: uv publish --publish-url https://test.pypi.org/legacy/
+      - name: Publish to PyPI
+        if: github.event_name != 'workflow_dispatch' || inputs.target == 'pypi'
+        run: uv publish
+
+  github-release:
+    needs: publish
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Create GitHub Release with the wheel and sdist attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --generate-notes

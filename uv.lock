@@ -4,7 +4,6 @@ requires-python = ">=3.11"
 
 [[package]]
 name = "gha-explorer"
-version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "plotext" },
