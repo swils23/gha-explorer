@@ -1,0 +1,39 @@
+# One grouped PR per ecosystem, every Monday morning — this is a small tool, so
+# there's no value in splitting updates by package or by semver level.
+version: 2
+updates:
+  # Python dependencies (pyproject.toml + uv.lock)
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+      timezone: "America/Chicago"
+    groups:
+      python-dependencies:
+        patterns: ["*"]
+    ignore:
+      # Major plotext releases have been API rewrites (5 -> 6 meant porting the
+      # chart code), so take the next major deliberately rather than via a bot PR.
+      # Minor/patch updates still come through.
+      - dependency-name: "plotext"
+        update-types: ["version-update:semver-major"]
+    commit-message:
+      prefix: "deps"
+    labels: ["dependencies"]
+
+  # Actions used by .github/workflows/*.yml
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+      timezone: "America/Chicago"
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+    labels: ["dependencies"]
