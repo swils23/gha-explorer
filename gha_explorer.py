@@ -664,6 +664,23 @@ class RateLimitError(GitHubAPIError):
     """The hourly budget is gone and we could not (or were told not to) wait for the reset."""
 
 
+class SyncStopped(Exception):
+    """The app is exiting; the sync gives up wherever it is (the cache keeps what landed)."""
+
+
+def _check_stop() -> None:
+    if STATS.stop_requested:
+        raise SyncStopped()
+
+
+def _sleep_unless_stopped(seconds: float) -> None:
+    """time.sleep that returns early (raising SyncStopped) when the app is quitting."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        _check_stop()
+        time.sleep(min(0.5, deadline - time.monotonic()))
+
+
 RATE_LIMIT_MAX_WAIT_S = 70 * 60  # core resets hourly; anything longer means the reset header is wrong
 
 
@@ -856,6 +873,7 @@ def _api_request(url: str, params: dict | None = None, *, retries: int = 4, coun
         headers["Authorization"] = f"Bearer {token}"
     attempt = 0
     while True:
+        _check_stop()
         req = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
@@ -895,7 +913,7 @@ def _api_request(url: str, params: dict | None = None, *, retries: int = 4, coun
                 STATS.rate_limit_retries += 1
                 log.warning("Rate limited (%d), retrying in %ds (attempt %d/%d): %s",
                             status, delay, attempt + 1, retries, url.split("?")[0])
-                time.sleep(delay)
+                _sleep_unless_stopped(delay)
                 attempt += 1
                 continue
             STATS.api_errors += 1
@@ -906,7 +924,7 @@ def _api_request(url: str, params: dict | None = None, *, retries: int = 4, coun
             if attempt < retries:
                 delay = 2 ** attempt
                 log.warning("Network error, retrying in %ds: %s", delay, exc)
-                time.sleep(delay)
+                _sleep_unless_stopped(delay)
                 attempt += 1
                 continue
             STATS.api_errors += 1
@@ -1620,12 +1638,12 @@ def _fetch_and_build(repo: str, raw_run: dict, retries: int = 2) -> RunData:
             raw_jobs = fetch_run_jobs(repo, run_id)
             cache_put_jobs(repo, run_id, raw_run, raw_jobs)
             return build_run_data(raw_run, raw_jobs)
-        except (AuthError, RateLimitError):
+        except (AuthError, RateLimitError, SyncStopped):
             raise
         except GitHubAPIError:
             if attempt == retries:
                 raise
-            time.sleep(1 * (attempt + 1))
+            _sleep_unless_stopped(1 * (attempt + 1))
             log.warning("Retrying fetch for run %s (attempt %d)", run_id, attempt + 2)
     raise RuntimeError("unreachable")
 
@@ -1667,13 +1685,17 @@ def _fetch_jobs_for_runs(repo: str, raw_runs: list[dict]) -> list[RunData]:
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {pool.submit(_fetch_and_build, repo, raw): raw for raw in raw_runs}
         for future in as_completed(futures):
+            if STATS.stop_requested:
+                # Quitting: drop everything queued; the few in-flight requests finish on
+                # their own within a second or two, then the pool can close.
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise SyncStopped()
             done += 1
             raw = futures[future]
             try:
                 runs.append(future.result())
-            except (AuthError, RateLimitError):
-                for f in futures:
-                    f.cancel()
+            except (AuthError, RateLimitError, SyncStopped):
+                pool.shutdown(wait=False, cancel_futures=True)
                 raise
             except Exception:
                 errors += 1
@@ -1901,6 +1923,7 @@ def fetch_incremental(repo: str, force_backfill: bool = False) -> list[RunData]:
     if gaps:
         log.info("Checking %d gap(s) of %d+ days in cached history", len(gaps), GAP_DAYS)
     for a, b in gaps:
+        _check_stop()
         label = f"{a:%Y-%m-%d} → {b:%Y-%m-%d}"
         STATS.set_phase("gaps", f"Checking gap {label}...")
         try:
@@ -1938,6 +1961,7 @@ def fetch_incremental(repo: str, force_backfill: bool = False) -> list[RunData]:
         window_end = oldest_date
         reached_floor = False
         for _ in range(MAX_BACKFILL_WINDOWS):
+            _check_stop()
             window_start = window_end - timedelta(days=BACKFILL_WINDOW_DAYS)
             label = f"{window_start:%Y-%m-%d} → {window_end:%Y-%m-%d}"
             STATS.current_window = label
@@ -4930,6 +4954,9 @@ class GHAExplorerApp(App):
         if event.state == WorkerState.SUCCESS:
             self._data_loaded(event.worker.result)
         elif event.state == WorkerState.ERROR:
+            if isinstance(event.worker.error, SyncStopped):
+                log.info("Sync stopped because the app is exiting")
+                return
             log.error("Worker failed: %s", event.worker.error)
             self._data_error(str(event.worker.error))
             if isinstance(event.worker.error, AuthError):
