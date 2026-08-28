@@ -85,7 +85,7 @@ from textual.worker import Worker, WorkerState, get_current_worker
 # Data directory — where cache.db and the log live
 # ---------------------------------------------------------------------------
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 DB_FILENAME = "gha-explorer.db"      # runs cache + settings + notes
 LEGACY_DB_FILENAME = "cache.db"      # original (pre-release) name, renamed on first launch
