@@ -678,6 +678,30 @@ def _note_rate_limit_headers(headers) -> None:
         pass
 
 
+def fmt_reset(reset_epoch: float) -> str:
+    """The one way a reset moment is printed anywhere: '21:32 (in 14m 10s)'."""
+    left = reset_epoch - time.time()
+    at = time.strftime("%H:%M", time.localtime(reset_epoch))
+    return f"{at} (in {fmt_elapsed(left)})" if left > 0 else f"{at} (passed)"
+
+
+def rate_limit_view(s: dict) -> dict | None:
+    """The core budget as every surface shows it, derived only from the last real
+    response's headers. Once that window's reset has passed the budget is full again
+    and there is nothing to count down. None until the first request of the session."""
+    rl = s.get("rate_limit")
+    if not rl or not rl.get("limit"):
+        return None
+    view = dict(rl)
+    checked = s.get("rate_limit_checked_at")
+    view["age_s"] = (time.monotonic() - checked) if checked else None
+    if rl.get("reset") and time.time() >= rl["reset"]:
+        view.update(remaining=rl["limit"], used=0, reset=None, restored=True)
+    else:
+        view["restored"] = False
+    return view
+
+
 def _wait_for_rate_limit_reset(reset_epoch: float, url: str) -> None:
     """Block this worker until the core bucket resets (in 1 s slices so quitting the
     app isn't held up). Raises RateLimitError if asked to stop or the wait is absurd."""
@@ -685,8 +709,8 @@ def _wait_for_rate_limit_reset(reset_epoch: float, url: str) -> None:
     if reset_in > RATE_LIMIT_MAX_WAIT_S:
         raise RateLimitError(f"API rate limit exhausted and the reset is {int(reset_in // 60)} min away")
     STATS.rate_limit_wait_until = reset_epoch + 2
-    log.warning("Rate limit exhausted — waiting %s for the reset before continuing (%s)",
-                fmt_elapsed(max(0, reset_in)), url.split("?")[0])
+    log.warning("API budget spent — waiting for the reset at %s, then continuing (%s)",
+                fmt_reset(reset_epoch), url.split("?")[0])
     try:
         while time.time() < reset_epoch + 2:
             if STATS.stop_requested:
@@ -952,28 +976,6 @@ def device_flow_poll(device_code: str) -> dict:
 
 
 # -- Endpoints used by the app
-
-def fetch_rate_limit() -> dict | None:
-    """Core rate-limit bucket via /rate_limit (free). Only a fallback: real responses
-    carry authoritative X-RateLimit headers, and this endpoint has been observed
-    returning a full bucket while the same token was actually at zero. Used when
-    nothing has been requested yet, or the last header reading's window has reset."""
-    current = STATS.rate_limit
-    if STATS.rate_limit_source == "headers" and current and time.time() < current.get("reset", 0):
-        return current
-    try:
-        data = api_get("rate_limit", retries=0, count=False)
-        core = data["resources"]["core"]
-        if STATS.rate_limit_source == "headers" and STATS.rate_limit and time.time() < STATS.rate_limit.get("reset", 0):
-            return STATS.rate_limit  # a header reading landed while we were polling; it wins
-        STATS.rate_limit = core
-        STATS.rate_limit_checked_at = time.monotonic()
-        STATS.rate_limit_source = "poll"
-        return core
-    except Exception:
-        log.debug("Could not fetch rate limit", exc_info=True)
-        return None
-
 
 def fetch_user_repos() -> list[dict]:
     """List all repos the user can access — personal, collaborator, and org member."""
@@ -4361,8 +4363,6 @@ class GHAExplorerApp(App):
 
     def _begin(self) -> None:
         """Start up once credentials are in place: rate-limit polling, then the repo."""
-        self.set_interval(30, self._poll_rate_limit)
-        self._poll_rate_limit()
         # --repo wins; then the GitHub repo of the directory we were launched in (so
         # `uvx gha-explorer` inside a checkout just works); then the last-used repo.
         detected = None if self._initial_repo else detect_current_repo()
@@ -4430,15 +4430,18 @@ class GHAExplorerApp(App):
                 if cache_msg:
                     text.append("  ·  ", style="#3A3450")
                 text.append(activity_msg, style=self.palette.primary_hex)
-            rl = STATS.rate_limit
+            rl = rate_limit_view(STATS.snapshot())
             self._status_rl_shown = (rl or {}).get("remaining"), (rl or {}).get("limit")
             # The budget is only interesting once some of it has been spent (the Status
             # tab always shows the full gauge).
-            if rl and rl.get("limit") and rl["remaining"] < rl["limit"]:
+            if rl and rl["remaining"] < rl["limit"]:
                 text.append("  ·  ", style="#3A3450")
-                frac = rl["remaining"] / rl["limit"] if rl.get("limit") else 1
+                frac = rl["remaining"] / rl["limit"]
                 color = self.palette.error_hex if frac < 0.1 else self.palette.warning_hex if frac < 0.3 else self.palette.muted_hex
-                text.append(f"API {rl['remaining']:,}/{rl['limit']:,}", style=color)
+                label = f"API {rl['remaining']:,}/{rl['limit']:,}"
+                if rl["remaining"] == 0 and rl.get("reset"):
+                    label += f" · resets {fmt_reset(rl['reset'])}"
+                text.append(label, style=color)
             status.update(text if text.plain else "Loading...")
         except Exception:
             pass
@@ -4455,10 +4458,9 @@ class GHAExplorerApp(App):
     def _rate_limit_wait_text(s: dict, short: bool = False) -> str | None:
         until = s.get("rate_limit_wait_until")
         if until and time.time() < until:
-            at, left = time.strftime("%H:%M", time.localtime(until)), fmt_elapsed(until - time.time())
             if short:
-                return f"API budget spent — paused until {at} ({left}), resumes by itself"
-            return f"Hourly API budget spent — GitHub resets it at {at}, in {left}; the sync resumes by itself"
+                return f"API budget spent — paused until {fmt_reset(until)}, resumes by itself"
+            return f"Hourly API budget spent — GitHub resets it at {fmt_reset(until)}; the sync resumes by itself"
         return None
 
     def _activity_text(self, s: dict) -> str:
@@ -4486,7 +4488,7 @@ class GHAExplorerApp(App):
                     self._render_first_sync_panel(s)
             else:
                 # Idle: the 30 s rate-limit poll keeps updating; redraw the bar when the numbers move
-                rl = s["rate_limit"] or {}
+                rl = rate_limit_view(s) or {}
                 if (rl.get("remaining"), rl.get("limit")) != getattr(self, "_status_rl_shown", (None, None)):
                     self._update_status_bar(*getattr(self, "_status_parts", ("", "")))
             self._render_status(s)
@@ -4581,7 +4583,7 @@ class GHAExplorerApp(App):
                 remaining = None if step_eta[key] is None else remaining + step_eta[key]
 
         # -- rate-limit budget: ~1 request per run + 1 per 100 listed + 1 per backfill window
-        rl = s.get("rate_limit") or {}
+        rl = rate_limit_view(s) or {}
         budget_note = ""
         if rl.get("limit"):
             reqs_left = 0
@@ -4590,15 +4592,15 @@ class GHAExplorerApp(App):
             if current <= 2:
                 reqs_left += max(0, (total - done) if current == 2 else runs_known)
             reqs_left += max(0, (s["backfill_total"] or 5) - (s["windows_done"] if current == 3 else 0))
-            avail = rl["remaining"] if time.time() < rl.get("reset", 0) else rl["limit"]
+            avail = rl["remaining"]
             if reqs_left > avail and remaining is not None:
-                reset_in = max(0.0, rl.get("reset", 0) - time.time())
+                reset_in = max(0.0, (rl.get("reset") or time.time()) - time.time())
                 waits = 1 + (reqs_left - avail - 1) // rl["limit"]
                 remaining += reset_in + (waits - 1) * 3600
                 budget_note = f"Needs about {reqs_left:,} more requests but {avail:,} remain in this hour's budget of {rl['limit']:,}."
                 if not self._rate_limit_wait_text(s):
                     budget_note += (" The sync pauses when it runs out and resumes by itself when GitHub resets the budget"
-                                    + (f" at {time.strftime('%H:%M', time.localtime(rl['reset']))}" if rl.get("reset") else "")
+                                    + (f" at {fmt_reset(rl['reset'])}" if rl.get("reset") else "")
                                     + (f" — expect {waits} pauses." if waits > 1 else "."))
                 elif waits > 1:
                     budget_note += f" Expect {waits} pauses in total."
@@ -4749,21 +4751,22 @@ class GHAExplorerApp(App):
         details.append(f"\nRepo:               {self.current_repo or '—'}")
         self.query_one("#sync-details", Static).update(details)
 
-        rl = s["rate_limit"]
+        rl = rate_limit_view(s)
         api_status = self.query_one("#api-status", Static)
         rate_gauge = self.query_one("#rate-gauge", Gauge)
         if rl:
-            reset_in = max(0, rl["reset"] - time.time())
-            rate_gauge.set_value(rl["remaining"], rl["limit"], f"reset {fmt_elapsed(reset_in)}",
-                                 color=p.success_hex, low_is_bad=True)
-            checked = ""
-            if s["rate_limit_checked_at"]:
-                checked = f"checked {fmt_elapsed(time.monotonic() - s['rate_limit_checked_at'])} ago"
-            source = "from response headers" if s.get("rate_limit_source") == "headers" else "from /rate_limit"
-            api_status.update(RichText(f"core bucket · {source} · {checked}", style=p.muted_hex))
+            if rl["restored"]:
+                detail = "window reset — full budget available"
+            elif rl.get("reset"):
+                detail = f"resets {fmt_reset(rl['reset'])}"
+            else:
+                detail = ""
+            rate_gauge.set_value(rl["remaining"], rl["limit"], detail, color=p.success_hex, low_is_bad=True)
+            age = f"{fmt_elapsed(rl['age_s'])} ago" if rl.get("age_s") is not None else "just now"
+            api_status.update(RichText(f"core bucket · from the last response's headers, {age}", style=p.muted_hex))
         else:
             rate_gauge.set_value(0, 0)
-            api_status.update(RichText("rate limit unknown", style=p.muted_hex))
+            api_status.update(RichText("budget unknown until the first API call", style=p.muted_hex))
         api_details = RichText()
         auth_label = {"env": "$GH_TOKEN", "gh CLI": "gh CLI login", "saved login": "built-in login",
                       "none": "not signed in"}.get(AUTH.source, AUTH.source)
@@ -4804,10 +4807,6 @@ class GHAExplorerApp(App):
             else:
                 cache_details.append("no repo selected", style=p.muted_hex)
             self.query_one("#cache-details", Static).update(cache_details)
-
-    @work(thread=True, exclusive=True, group="rate_limit", exit_on_error=False)
-    def _poll_rate_limit(self) -> None:
-        fetch_rate_limit()
 
     # -- Fetching --
 
@@ -4865,7 +4864,6 @@ class GHAExplorerApp(App):
             self._populate_sidebar()
             self._render_status(STATS.snapshot())
             self.set_timer(0.1, self._render_all_tabs)
-            self._poll_rate_limit()
         except Exception:
             log.exception("Error in _data_loaded")
 
