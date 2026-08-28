@@ -315,8 +315,11 @@ class SyncStats:
     started_at: float | None = None
     finished_at: float | None = None
     last_error: str = ""
-    rate_limit: dict | None = None  # {"limit", "remaining", "reset", "used"} from gh api rate_limit
+    rate_limit: dict | None = None  # {"limit", "remaining", "reset", "used"} for the core bucket
     rate_limit_checked_at: float | None = None
+    rate_limit_source: str = ""          # "headers" (authoritative) or "poll" (/rate_limit, which can lag or lie)
+    rate_limit_wait_until: float | None = None  # epoch seconds while a worker is waiting for the reset
+    stop_requested: bool = False         # set when the app exits so waiting workers give up promptly
     # First-sync panel: which steps ran, how long each took, what's left to estimate
     first_load: bool = False
     phase_started_at: float | None = None
@@ -647,6 +650,52 @@ class AuthError(GitHubAPIError):
     """401 — no token, or the token is invalid/revoked. The UI reacts by signing in again."""
 
 
+class RateLimitError(GitHubAPIError):
+    """The hourly budget is gone and we could not (or were told not to) wait for the reset."""
+
+
+RATE_LIMIT_MAX_WAIT_S = 70 * 60  # core resets hourly; anything longer means the reset header is wrong
+
+
+def _note_rate_limit_headers(headers) -> None:
+    """Record the core bucket from a real response. These headers are authoritative;
+    the /rate_limit endpoint has been seen reporting 5000/5000 for a token whose
+    requests were simultaneously returning remaining=0."""
+    try:
+        if headers is None or headers.get("X-RateLimit-Resource", "core") != "core":
+            return
+        limit, remaining = headers.get("X-RateLimit-Limit"), headers.get("X-RateLimit-Remaining")
+        if limit is None or remaining is None:
+            return
+        STATS.rate_limit = {
+            "limit": int(limit), "remaining": int(remaining),
+            "reset": int(headers.get("X-RateLimit-Reset", "0") or 0),
+            "used": int(headers.get("X-RateLimit-Used", "0") or 0),
+        }
+        STATS.rate_limit_checked_at = time.monotonic()
+        STATS.rate_limit_source = "headers"
+    except (TypeError, ValueError):
+        pass
+
+
+def _wait_for_rate_limit_reset(reset_epoch: float, url: str) -> None:
+    """Block this worker until the core bucket resets (in 1 s slices so quitting the
+    app isn't held up). Raises RateLimitError if asked to stop or the wait is absurd."""
+    reset_in = reset_epoch - time.time()
+    if reset_in > RATE_LIMIT_MAX_WAIT_S:
+        raise RateLimitError(f"API rate limit exhausted and the reset is {int(reset_in // 60)} min away")
+    STATS.rate_limit_wait_until = reset_epoch + 2
+    log.warning("Rate limit exhausted — waiting %s for the reset before continuing (%s)",
+                fmt_elapsed(max(0, reset_in)), url.split("?")[0])
+    try:
+        while time.time() < reset_epoch + 2:
+            if STATS.stop_requested:
+                raise RateLimitError("API rate limit exhausted; stopped while waiting for the reset")
+            time.sleep(1)
+    finally:
+        STATS.rate_limit_wait_until = None
+
+
 @dataclass
 class AuthState:
     token: str | None = None
@@ -771,16 +820,19 @@ def _api_request(url: str, params: dict | None = None, *, retries: int = 4, coun
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    for attempt in range(retries + 1):
+    attempt = 0
+    while True:
         req = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 body = resp.read().decode("utf-8")
                 if count:
                     STATS.api_calls += 1
+                _note_rate_limit_headers(resp.headers)
                 return (json.loads(body) if body.strip() else None), resp.headers
         except urllib.error.HTTPError as exc:
             status = exc.code
+            _note_rate_limit_headers(exc.headers)
             body = exc.read().decode("utf-8", "replace")
             try:
                 message = json.loads(body).get("message", body)
@@ -796,24 +848,19 @@ def _api_request(url: str, params: dict | None = None, *, retries: int = 4, coun
             rate_limited = status in (403, 429) and (
                 retry_after is not None or remaining == "0" or "rate limit" in message.lower()
             )
+            if rate_limited and remaining == "0" and not retry_after:
+                # Primary limit: the hour's budget is spent. Wait for the reset and carry on —
+                # a first sync of a big repo needs more than 5,000 requests, so this is normal.
+                STATS.rate_limit_retries += 1
+                _wait_for_rate_limit_reset(int(exc.headers.get("X-RateLimit-Reset", "0") or 0), url)
+                continue  # doesn't count as an attempt
             if rate_limited and attempt < retries:
-                if retry_after:
-                    delay = min(int(float(retry_after)), 120)
-                elif remaining == "0":
-                    reset_in = int(exc.headers.get("X-RateLimit-Reset", "0")) - time.time()
-                    if reset_in > 120:
-                        STATS.api_errors += 1
-                        STATS.last_error = f"rate limited, resets in {int(reset_in // 60)}m"
-                        raise GitHubAPIError(
-                            f"API rate limit exhausted — resets in {int(reset_in // 60)} min", status
-                        ) from None
-                    delay = max(1, int(reset_in) + 1)
-                else:
-                    delay = 2 ** attempt
+                delay = min(int(float(retry_after)), 120) if retry_after else 2 ** attempt
                 STATS.rate_limit_retries += 1
                 log.warning("Rate limited (%d), retrying in %ds (attempt %d/%d): %s",
                             status, delay, attempt + 1, retries, url.split("?")[0])
                 time.sleep(delay)
+                attempt += 1
                 continue
             STATS.api_errors += 1
             STATS.last_error = f"{status} {message}"[-200:]
@@ -824,6 +871,7 @@ def _api_request(url: str, params: dict | None = None, *, retries: int = 4, coun
                 delay = 2 ** attempt
                 log.warning("Network error, retrying in %ds: %s", delay, exc)
                 time.sleep(delay)
+                attempt += 1
                 continue
             STATS.api_errors += 1
             STATS.last_error = f"network: {exc}"[-200:]
@@ -906,12 +954,21 @@ def device_flow_poll(device_code: str) -> dict:
 # -- Endpoints used by the app
 
 def fetch_rate_limit() -> dict | None:
-    """Core rate-limit bucket. This endpoint doesn't count against the limit."""
+    """Core rate-limit bucket via /rate_limit (free). Only a fallback: real responses
+    carry authoritative X-RateLimit headers, and this endpoint has been observed
+    returning a full bucket while the same token was actually at zero. Used when
+    nothing has been requested yet, or the last header reading's window has reset."""
+    current = STATS.rate_limit
+    if STATS.rate_limit_source == "headers" and current and time.time() < current.get("reset", 0):
+        return current
     try:
         data = api_get("rate_limit", retries=0, count=False)
         core = data["resources"]["core"]
+        if STATS.rate_limit_source == "headers" and STATS.rate_limit and time.time() < STATS.rate_limit.get("reset", 0):
+            return STATS.rate_limit  # a header reading landed while we were polling; it wins
         STATS.rate_limit = core
         STATS.rate_limit_checked_at = time.monotonic()
+        STATS.rate_limit_source = "poll"
         return core
     except Exception:
         log.debug("Could not fetch rate limit", exc_info=True)
@@ -1549,7 +1606,7 @@ def _fetch_and_build(repo: str, raw_run: dict, retries: int = 2) -> RunData:
             raw_jobs = fetch_run_jobs(repo, run_id)
             cache_put_jobs(repo, run_id, raw_run, raw_jobs)
             return build_run_data(raw_run, raw_jobs)
-        except AuthError:
+        except (AuthError, RateLimitError):
             raise
         except GitHubAPIError:
             if attempt == retries:
@@ -1574,7 +1631,7 @@ def _fetch_jobs_for_runs(repo: str, raw_runs: list[dict]) -> list[RunData]:
             raw = futures[future]
             try:
                 runs.append(future.result())
-            except AuthError:
+            except (AuthError, RateLimitError):
                 for f in futures:
                     f.cancel()
                 raise
@@ -1752,8 +1809,13 @@ def fetch_incremental(repo: str, force_backfill: bool = False) -> list[RunData]:
 
     new_runs: list[RunData] = []
 
-    # Step 2: forward fetch
+    # Step 2: forward fetch. If a previous sync was interrupted while fetching job
+    # timings, the cache has holes newer than its oldest run; re-list everything so
+    # they get filled (only the missing runs' details are fetched again).
     newest_date = cached_runs[-1].created_at.isoformat() if cached_runs else None
+    if newest_date and settings_get(repo, "relist_needed", False):
+        log.info("Previous sync was interrupted mid-fetch — re-listing all runs to fill holes")
+        newest_date = None
     if newest_date:
         STATS.set_phase("forward", f"Checking for new runs since {newest_date[:10]}...")
     else:
@@ -1775,6 +1837,7 @@ def fetch_incremental(repo: str, force_backfill: bool = False) -> list[RunData]:
 
     if forward_new:
         STATS.set_phase("details", f"Fetching job timings for {len(forward_new):,} runs...")
+        settings_set(repo, "relist_needed", True)  # cleared once this sync completes
         new_runs.extend(_fetch_jobs_for_runs(repo, forward_new))
         cached_ids.update(r.run_id for r in new_runs)
 
@@ -1878,6 +1941,8 @@ def fetch_incremental(repo: str, force_backfill: bool = False) -> list[RunData]:
     total_new = len(new_runs)
     all_runs = cached_runs + new_runs
     all_runs.sort(key=lambda r: r.created_at)
+    if STATS.phase != "rate-limited":
+        settings_set(repo, "relist_needed", False)
     meta_set(repo)
 
     if STATS.phase != "rate-limited":
@@ -4281,6 +4346,13 @@ class GHAExplorerApp(App):
         else:
             self._begin()
 
+    def action_quit(self) -> None:
+        STATS.stop_requested = True  # lets a worker sleeping through a rate-limit reset exit promptly
+        self.exit()
+
+    def on_unmount(self) -> None:
+        STATS.stop_requested = True
+
     def _on_signed_in(self, token: str | None) -> None:
         if not token:
             self.exit(message="Sign-in cancelled — GHA Explorer needs GitHub access to fetch runs.")
@@ -4379,7 +4451,19 @@ class GHAExplorerApp(App):
         newest = runs[-1].created_at.strftime("%Y-%m-%d")
         return f"{len(runs)} runs ({oldest} → {newest})"
 
+    @staticmethod
+    def _rate_limit_wait_text(s: dict, short: bool = False) -> str | None:
+        until = s.get("rate_limit_wait_until")
+        if until and time.time() < until:
+            at, left = time.strftime("%H:%M", time.localtime(until)), fmt_elapsed(until - time.time())
+            if short:
+                return f"API budget spent — paused until {at} ({left}), resumes by itself"
+            return f"Hourly API budget spent — GitHub resets it at {at}, in {left}; the sync resumes by itself"
+        return None
+
     def _activity_text(self, s: dict) -> str:
+        if wait := self._rate_limit_wait_text(s, short=True):
+            return wait
         labels = {"details": "Fetching job timings", "forward": "Listing runs", "backfill": "Checking older history"}
         if s["phase"] in labels and s["total"]:
             done, total = min(s["done"], s["total"]), s["total"]
@@ -4434,8 +4518,12 @@ class GHAExplorerApp(App):
 
     def _first_sync_step_index(self, s: dict) -> int:
         phase = s["phase"]
-        if phase in ("done", "error", "rate-limited"):
+        if phase == "done":
             return len(self.FIRST_SYNC_STEPS)
+        if phase in ("error", "rate-limited"):  # stay on the step that was running
+            keys = [k for k, _ in self.FIRST_SYNC_STEPS]
+            ran = [keys.index(k) for k in s["step_elapsed"] if k in keys]
+            return max(ran) if ran else 0
         if phase == "details" and "backfill" in s["step_elapsed"]:
             return 3  # job timings for runs found while checking older history
         if phase == "gaps":
@@ -4492,6 +4580,29 @@ class GHAExplorerApp(App):
             if remaining is not None:
                 remaining = None if step_eta[key] is None else remaining + step_eta[key]
 
+        # -- rate-limit budget: ~1 request per run + 1 per 100 listed + 1 per backfill window
+        rl = s.get("rate_limit") or {}
+        budget_note = ""
+        if rl.get("limit"):
+            reqs_left = 0
+            if current <= 1 and total:
+                reqs_left += -(-max(0, total - done) // 100)
+            if current <= 2:
+                reqs_left += max(0, (total - done) if current == 2 else runs_known)
+            reqs_left += max(0, (s["backfill_total"] or 5) - (s["windows_done"] if current == 3 else 0))
+            avail = rl["remaining"] if time.time() < rl.get("reset", 0) else rl["limit"]
+            if reqs_left > avail and remaining is not None:
+                reset_in = max(0.0, rl.get("reset", 0) - time.time())
+                waits = 1 + (reqs_left - avail - 1) // rl["limit"]
+                remaining += reset_in + (waits - 1) * 3600
+                budget_note = f"Needs about {reqs_left:,} more requests but {avail:,} remain in this hour's budget of {rl['limit']:,}."
+                if not self._rate_limit_wait_text(s):
+                    budget_note += (" The sync pauses when it runs out and resumes by itself when GitHub resets the budget"
+                                    + (f" at {time.strftime('%H:%M', time.localtime(rl['reset']))}" if rl.get("reset") else "")
+                                    + (f" — expect {waits} pauses." if waits > 1 else "."))
+                elif waits > 1:
+                    budget_note += f" Expect {waits} pauses in total."
+
         # -- header
         out = RichText()
         out.append(f"First sync of {self.current_repo}", style=f"bold {p.primary_hex}")
@@ -4540,10 +4651,14 @@ class GHAExplorerApp(App):
             out.append("╌" * (bar_w - filled), style="#3A3450")
             out.append(f"  {int(min(1.0, frac) * 100):>3}%", style="bold")
         out.append("\n")
-        if s["phase"] in ("rate-limited", "error"):
+        if wait := self._rate_limit_wait_text(s):
+            out.append(f"\n  ⏸  {wait}.", style=f"bold {p.warning_hex}")
+        elif s["phase"] in ("rate-limited", "error"):
             out.append(f"\n  {s['message']}", style=p.warning_hex if s["phase"] == "rate-limited" else p.error_hex)
         elif s["message"]:
             out.append(f"\n  {s['message']}", style=p.muted_hex)
+        if budget_note:
+            out.append(f"\n  {budget_note}", style=p.muted_hex)
         body.set_message(out)
 
     def _first_sync_step_detail(self, key: str, idx: int, current: int, s: dict, eta: float | None,
@@ -4644,7 +4759,8 @@ class GHAExplorerApp(App):
             checked = ""
             if s["rate_limit_checked_at"]:
                 checked = f"checked {fmt_elapsed(time.monotonic() - s['rate_limit_checked_at'])} ago"
-            api_status.update(RichText(f"core bucket · {checked}", style=p.muted_hex))
+            source = "from response headers" if s.get("rate_limit_source") == "headers" else "from /rate_limit"
+            api_status.update(RichText(f"core bucket · {source} · {checked}", style=p.muted_hex))
         else:
             rate_gauge.set_value(0, 0)
             api_status.update(RichText("rate limit unknown", style=p.muted_hex))
