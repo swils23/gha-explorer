@@ -856,7 +856,8 @@ def auth_status_text() -> str:
 
 
 def _api_request(url: str, params: dict | None = None, *, retries: int = 4, count: bool = True,
-                 token: str | None = None, wait_for_reset: bool = True) -> tuple[object, object]:
+                 token: str | None = None, wait_for_reset: bool = True,
+                 etag: str | None = None) -> tuple[object, object]:
     """GET one URL. Returns (parsed JSON, response headers).
 
     Retries with backoff on network errors and on secondary rate limits (Retry-After);
@@ -873,6 +874,8 @@ def _api_request(url: str, params: dict | None = None, *, retries: int = 4, coun
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    if etag:
+        headers["If-None-Match"] = etag  # a 304 costs nothing and still carries the rate-limit headers
     attempt = 0
     while True:
         _check_stop()
@@ -887,6 +890,8 @@ def _api_request(url: str, params: dict | None = None, *, retries: int = 4, coun
         except urllib.error.HTTPError as exc:
             status = exc.code
             _note_rate_limit_headers(exc.headers)
+            if status == 304:
+                return None, exc.headers  # Not Modified: free, and the headers are current
             body = exc.read().decode("utf-8", "replace")
             try:
                 message = json.loads(body).get("message", body)
@@ -1005,6 +1010,28 @@ def device_flow_poll(device_code: str) -> dict:
         "device_code": device_code,
         "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
     })
+
+
+# -- Free budget probe: a conditional GET whose 304 doesn't count but reports the live headers
+
+PROBE_ETAG_KEY = "budget_probe_etag"
+
+
+def probe_api_budget() -> None:
+    """Refresh STATS.rate_limit accurately without spending budget. GET /user with the
+    ETag from last time returns 304 — free — and every response, 304 included, carries
+    the authoritative X-RateLimit headers. (The /rate_limit endpoint has been seen
+    reporting a full bucket while these headers said otherwise, so it isn't used.)
+    Only the very first probe ever costs one request, to learn the ETag."""
+    etag = settings_get(GLOBAL_SCOPE, PROBE_ETAG_KEY)
+    try:
+        _, headers = _api_request(f"{GITHUB_API}/user", retries=0, count=False, wait_for_reset=False, etag=etag)
+    except GitHubAPIError as exc:
+        log.debug("Budget probe: %s", exc)  # a 403 still carried fresh headers
+        return
+    new_etag = headers.get("ETag") if headers is not None else None
+    if new_etag and new_etag != etag:
+        settings_set(GLOBAL_SCOPE, PROBE_ETAG_KEY, new_etag)
 
 
 # -- Endpoints used by the app
@@ -4455,7 +4482,7 @@ class GHAExplorerApp(App):
                         with Horizontal(classes="card-title-row"):
                             yield Label("GitHub API", classes="card-title")
                             yield Button("↻", id="api-refresh", classes="card-refresh", compact=True,
-                                         tooltip="Re-check the budget now (one request)")
+                                         tooltip="Re-check the budget now (free — conditional request)")
                         yield Static("", id="api-status")
                         yield Gauge("Remaining", id="rate-gauge")
                         yield Static("", id="api-details")
@@ -4504,7 +4531,9 @@ class GHAExplorerApp(App):
         self._begin()
 
     def _begin(self) -> None:
-        """Start up once credentials are in place: rate-limit polling, then the repo."""
+        """Start up once credentials are in place: budget probe, then the repo."""
+        self._probe_api_budget()
+        self.set_interval(60, self._probe_api_budget)  # free (304), so the idle display stays current
         # --repo wins; then the GitHub repo of the directory we were launched in (so
         # `uvx gha-explorer` inside a checkout just works); then the last-used repo.
         detected = None if self._initial_repo else detect_current_repo()
@@ -4937,7 +4966,7 @@ class GHAExplorerApp(App):
             api_status.update(RichText(f"core bucket · from the last response's headers, {age}", style=p.muted_hex))
         else:
             rate_gauge.set_value(0, 0)
-            api_status.update(RichText("budget unknown until the first API call", style=p.muted_hex))
+            api_status.update(RichText("checking the budget…", style=p.muted_hex))
         api_details = RichText()
         auth_label = {"env": "$GH_TOKEN", "gh CLI": "gh CLI login", "saved login": "built-in login",
                       "none": "not signed in"}.get(AUTH.source, AUTH.source)
@@ -5056,11 +5085,8 @@ class GHAExplorerApp(App):
 
     @work(thread=True, exclusive=True, group="budget-probe", exit_on_error=False)
     def _probe_api_budget(self) -> None:
-        """One cheap authenticated request; its headers refresh the budget everywhere."""
-        try:
-            _api_request(f"{GITHUB_API}/user", retries=0, count=False, wait_for_reset=False)
-        except GitHubAPIError as exc:
-            log.debug("Budget probe: %s", exc)  # a 403 still carried fresh headers
+        """Free conditional request; its headers refresh the budget everywhere."""
+        probe_api_budget()
 
     @on(Button.Pressed, "#cache-refresh")
     def _on_cache_refresh(self, event: Button.Pressed) -> None:
