@@ -1471,6 +1471,92 @@ def _fetch_jobs_for_runs(repo: str, raw_runs: list[dict]) -> list[RunData]:
     return runs
 
 
+def repair_missing_workflow_names(repo: str) -> tuple[int, int, int]:
+    """Fill in workflow names for cached runs that were stored without one.
+
+    Early versions didn't request the workflow name, so those runs show up as
+    "(unknown)" forever (the cache never re-fetches a run). Two passes:
+
+    1. Re-list the affected date range from the API (cheap: a few list calls) and
+       copy the names for runs GitHub still knows about.
+    2. For runs GitHub has aged out, infer the workflow from the run's job names,
+       using the repo's named runs as the reference: a job counts only if it
+       belongs to a single workflow >= 90% of the time, and at least two thirds
+       of the run's jobs must agree. Inferred names are flagged in raw_run.
+
+    Returns (blank_before, fixed_from_api, fixed_by_inference).
+    """
+    conn = _cache_conn()
+    rows = conn.execute(
+        "SELECT run_id, raw_run, raw_jobs FROM run_jobs WHERE repo = ? "
+        "AND COALESCE(json_extract(raw_run, '$.workflowName'), '') = ''",
+        (repo,),
+    ).fetchall()
+    if not rows:
+        return 0, 0, 0
+    blanks = {rid: (json.loads(rr), json.loads(rj)) for rid, rr, rj in rows}
+    log.info("%d cached runs have no workflow name — repairing", len(blanks))
+    fixed_api = fixed_inferred = 0
+
+    # Pass 1: the API, in 90-day windows over the blank runs' dates (newest first;
+    # stop once a window comes back empty — older runs have aged out too)
+    dates = sorted(parse_dt(r["createdAt"]) for r, _ in blanks.values())
+    window_end = dates[-1]
+    names_from_api: dict[int, str] = {}
+    while window_end >= dates[0] and len(names_from_api) < len(blanks):
+        window_start = window_end - timedelta(days=BACKFILL_WINDOW_DAYS)
+        try:
+            listed = fetch_run_list_complete(repo, since_date=window_start.isoformat(), until_date=window_end.isoformat())
+        except subprocess.CalledProcessError:
+            log.warning("Workflow-name repair: API window failed; will retry next launch")
+            break
+        hits = {r["databaseId"]: r.get("workflowName") or "" for r in listed if r["databaseId"] in blanks}
+        names_from_api.update({k: v for k, v in hits.items() if v})
+        if not listed:
+            break
+        window_end = window_start
+    with conn:
+        for rid, name in names_from_api.items():
+            raw_run, _ = blanks.pop(rid)
+            raw_run["workflowName"] = name
+            conn.execute("UPDATE run_jobs SET raw_run = ? WHERE run_id = ?", (json.dumps(raw_run), rid))
+            fixed_api += 1
+
+    # Pass 2: infer from job names, using the named runs as the reference
+    if blanks:
+        signature: dict[str, dict[str, int]] = {}
+        for rr, rj in conn.execute(
+            "SELECT raw_run, raw_jobs FROM run_jobs WHERE repo = ? "
+            "AND COALESCE(json_extract(raw_run, '$.workflowName'), '') != ''", (repo,)
+        ).fetchall():
+            wf = json.loads(rr)["workflowName"]
+            for job in {j["name"] for j in json.loads(rj)}:
+                signature.setdefault(job, {}).setdefault(wf, 0)
+                signature[job][wf] += 1
+        with conn:
+            for rid, (raw_run, raw_jobs) in list(blanks.items()):
+                jobs = {j["name"] for j in raw_jobs}
+                votes: dict[str, int] = {}
+                for job in jobs:
+                    counts = signature.get(job)
+                    if not counts:
+                        continue
+                    wf, n = max(counts.items(), key=lambda kv: kv[1])
+                    if n / sum(counts.values()) >= 0.9:
+                        votes[wf] = votes.get(wf, 0) + 1
+                if votes:
+                    wf, v = max(votes.items(), key=lambda kv: kv[1])
+                    if v >= max(1, 0.67 * len(jobs)):
+                        raw_run["workflowName"] = wf
+                        raw_run["workflowNameInferred"] = True
+                        conn.execute("UPDATE run_jobs SET raw_run = ? WHERE run_id = ?", (json.dumps(raw_run), rid))
+                        fixed_inferred += 1
+                        del blanks[rid]
+    log.info("Workflow-name repair: %d from the API, %d inferred from job names, %d still unknown",
+             fixed_api, fixed_inferred, len(blanks))
+    return len(rows), fixed_api, fixed_inferred
+
+
 def fetch_incremental(repo: str, force_backfill: bool = False) -> list[RunData]:
     """Incrementally fetch runs for `repo`, using cache to avoid re-fetching.
 
@@ -1480,8 +1566,14 @@ def fetch_incremental(repo: str, force_backfill: bool = False) -> list[RunData]:
        then remember that backfill is complete so future launches skip it
     4. Return merged + sorted result
     """
-    # Step 1: cache
+    # Step 1: cache (repairing runs stored without a workflow name first)
     STATS.set_phase("cache", "Loading cache...")
+    try:
+        blank, from_api, inferred = repair_missing_workflow_names(repo)
+        if blank:
+            STATS.set_phase("cache", f"Repaired workflow names: {from_api} from API, {inferred} inferred")
+    except Exception:
+        log.exception("Workflow-name repair failed; continuing with cached data as-is")
     cached_runs = cache_load_all(repo)
     cached_ids = cache_get_all_ids(repo)
     log.info("Cache loaded for %s: %d runs (%d in DB)", repo, len(cached_runs), len(cached_ids))
@@ -3605,25 +3697,17 @@ class FilterSidebar(Vertical):
     }
     FilterSidebar .sidebar-footer {
         dock: bottom;
-        height: 1;
+        height: 3;
         align-horizontal: right;
         padding-right: 1;
     }
-    FilterSidebar .sidebar-collapse {
-        min-width: 3;
-        width: 3;
-        background: $panel;
-        color: $text-muted;
-    }
-    FilterSidebar .sidebar-collapse:hover {
-        background: $secondary 40%;
-        color: $text;
-    }
+    /* .sidebar-collapse itself is styled in the App CSS: rules here would lose to
+       Button's own DEFAULT_CSS. */
     """
 
     def compose(self) -> ComposeResult:
         with Horizontal(classes="sidebar-footer"):
-            yield Button("<", classes="sidebar-collapse", compact=True, tooltip="Collapse filters (f)")
+            yield Button("<", classes="sidebar-collapse", tooltip="Collapse filters (f)")
         yield Label("Workflow")
         yield OptionList(classes="workflow-select")
         yield Label("Job")
@@ -3796,7 +3880,7 @@ class GHAExplorerApp(App):
         padding: 0 1;
     }
     .sidebar-strip {
-        width: 3;
+        width: 5;
         height: 1fr;
         border-right: solid $secondary;
         background: $surface;
@@ -3805,14 +3889,25 @@ class GHAExplorerApp(App):
     }
     .sidebar-strip Button {
         dock: bottom;
-        min-width: 3;
-        width: 3;
-        background: $panel;
-        color: $text-muted;
     }
-    .sidebar-strip Button:hover {
-        background: $secondary 40%;
+    /* The < and > sidebar toggles: bordered in the accent colour so they read as clickable. */
+    .sidebar-strip Button, .sidebar-collapse {
+        min-width: 5;
+        width: 5;
+        height: 3;
+        border: round $primary;
+        background: $surface;
+        color: $primary;
+        text-style: bold;
+    }
+    .sidebar-strip Button:hover, .sidebar-collapse:hover {
+        background: $primary 30%;
         color: $text;
+        border: round $primary;
+    }
+    .sidebar-strip Button:focus, .sidebar-collapse:focus {
+        border: round $primary;
+        text-style: bold;
     }
 
     /* Status tab */
@@ -3924,7 +4019,7 @@ class GHAExplorerApp(App):
         with ContentSwitcher(initial="trends", id="content"):
             with Horizontal(id="trends"):
                 with Vertical(classes="sidebar-strip"):
-                    yield Button(">", classes="sidebar-expand", compact=True, tooltip="Show filters (f)")
+                    yield Button(">", classes="sidebar-expand", tooltip="Show filters (f)")
                 yield FilterSidebar()
                 with Vertical(classes="tab-body"):
                     with Horizontal(id="trends-header"):
@@ -3934,7 +4029,7 @@ class GHAExplorerApp(App):
                         yield TrendChart(id="trends-body")
             with Horizontal(id="runs-tab"):
                 with Vertical(classes="sidebar-strip"):
-                    yield Button(">", classes="sidebar-expand", compact=True, tooltip="Show filters (f)")
+                    yield Button(">", classes="sidebar-expand", tooltip="Show filters (f)")
                 yield FilterSidebar()
                 yield DataTable(id="runs-table", classes="tab-body")
             with Vertical(id="status-tab", classes="status-pane"):
@@ -4500,7 +4595,7 @@ class GHAExplorerApp(App):
         })
 
     def _content_width(self) -> int:
-        sidebar = 34 if self._sidebar_visible else 4
+        sidebar = 34 if self._sidebar_visible else 6
         return max(self.size.width - sidebar, 60)
 
     def _fit_tabs(self) -> None:
