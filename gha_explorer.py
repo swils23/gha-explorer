@@ -4326,6 +4326,10 @@ class GHAExplorerApp(App):
     """
     BINDINGS = [
         Binding("q", "quit", "Quit"),
+        # Regular terminal exits work too, with no "press ctrl+q" lecture. Priority so
+        # they win over widget bindings (Input's ctrl+c is "copy" — quitting matters more).
+        Binding("ctrl+c", "quit", "Quit", show=False, priority=True),
+        Binding("ctrl+d", "quit_unless_editing", "Quit", show=False, priority=True),
         Binding("r", "refresh", "Refresh"),
         Binding("R", "full_rescan", "Full rescan", show=False),
         Binding("s", "switch_repo", "Switch Repo"),
@@ -4449,6 +4453,15 @@ class GHAExplorerApp(App):
     def action_quit(self) -> None:
         STATS.stop_requested = True  # lets a worker sleeping through a rate-limit reset exit promptly
         self.exit()
+
+    def action_quit_unless_editing(self) -> None:
+        """ctrl+d: EOF quits — unless a text field has focus, where it deletes forward
+        like it does in a shell line editor."""
+        focused = self.focused
+        if isinstance(focused, (Input, TextArea)):
+            focused.action_delete_right()
+            return
+        self.action_quit()
 
     def on_unmount(self) -> None:
         STATS.stop_requested = True
