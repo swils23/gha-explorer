@@ -3636,30 +3636,50 @@ class TrendChart(Static):
     def __init__(self, **kwargs) -> None:
         super().__init__("", **kwargs)
         self._parts: list = []
-        self._geom: ChartGeometry | None = None
+        # (part index, row offset of that part within the body, geometry) for every
+        # chart that shares the time axis — the trend chart and the group-member chart
+        self._charts: list[tuple[int, int, ChartGeometry]] = []
+        self._drag_chart: tuple[int, int, ChartGeometry] | None = None
         self._drag_start: int | None = None
         self._drag_cur: int | None = None
 
-    def set_content(self, parts: list, geom: ChartGeometry | None) -> None:
+    def set_content(self, parts: list, geoms: dict[int, ChartGeometry | None]) -> None:
+        """`geoms` maps a part index to that chart's geometry (None for non-draggable parts)."""
         self._parts = parts
-        self._geom = geom
+        self._charts = []
+        row = 0
+        for i, part in enumerate(parts):
+            geom = geoms.get(i)
+            if geom is not None:
+                self._charts.append((i, row, geom))
+            text = part.plain if isinstance(part, RichText) else str(part)
+            row += text.count("\n") + 1
+        self._drag_chart = None
         self._drag_start = self._drag_cur = None
         self.update(RichGroup(*parts))
 
     def set_message(self, text: str) -> None:
-        self._parts, self._geom = [], None
+        self._parts, self._charts = [], []
         self.update(text)
 
     def _col(self, event: events.MouseEvent) -> int:
         return event.offset.x - int(self.styles.padding.left)
 
-    def _in_chart(self, event: events.MouseEvent) -> bool:
-        g = self._geom
-        return g is not None and g.top <= event.offset.y <= g.bottom
+    def _chart_at(self, event: events.MouseEvent) -> tuple[int, int, ChartGeometry] | None:
+        y = event.offset.y - int(self.styles.padding.top)
+        for entry in self._charts:
+            _, row, g = entry
+            if row + g.top <= y <= row + g.bottom:
+                return entry
+        return None
 
     def on_mouse_down(self, event: events.MouseDown) -> None:
-        if event.button != 1 or not self._in_chart(event):
+        if event.button != 1:
             return
+        hit = self._chart_at(event)
+        if hit is None:
+            return
+        self._drag_chart = hit
         self._drag_start = self._drag_cur = self._col(event)
         self.capture_mouse()
 
@@ -3674,24 +3694,32 @@ class TrendChart(Static):
             return
         self.release_mouse()
         start, end = self._drag_start, self._col(event)
+        chart = self._drag_chart
+        self._drag_chart = None
         self._drag_start = self._drag_cur = None
         self.update(RichGroup(*self._parts))
-        if self._geom and abs(end - start) >= 1:
-            f0, f1 = sorted((self._geom.col_to_fraction(start), self._geom.col_to_fraction(end)))
+        if chart is not None and abs(end - start) >= 1:
+            g = chart[2]
+            f0, f1 = sorted((g.col_to_fraction(start), g.col_to_fraction(end)))
             self.post_message(self.ZoomSelected(f0, f1))
 
     def _render_drag(self) -> None:
-        g = self._geom
-        if g is None or self._drag_start is None or self._drag_cur is None or not self._parts:
+        if self._drag_chart is None or self._drag_start is None or self._drag_cur is None:
+            return
+        index, _, g = self._drag_chart
+        part = self._parts[index]
+        if not isinstance(part, RichText):
             return
         c0, c1 = sorted((self._drag_start, self._drag_cur))
         c0, c1 = max(c0, g.left), min(c1, g.right)
-        lines = self._parts[0].copy().split("\n")
+        lines = part.copy().split("\n")
         highlight = RichStyle(bgcolor="#3A3450")
         for row in range(g.top + 1, g.bottom):
             if row < len(lines):
                 lines[row].stylize(highlight, c0, c1 + 1)
-        self.update(RichGroup(RichText("\n").join(lines), *self._parts[1:]))
+        parts = list(self._parts)
+        parts[index] = RichText("\n").join(lines)
+        self.update(RichGroup(*parts))
 
 
 class DateRangeScreen(ModalScreen[tuple[date, date] | None]):
@@ -4975,7 +5003,7 @@ class GHAExplorerApp(App):
         positioned = note_x_positions(plot_runs, job_notes)
         note_rgb = _hex_to_rgb(p.error_hex)
         self._plot_run_dates = [r.created_at for r in plot_runs]
-        geom: ChartGeometry | None = None
+        geoms: dict[int, ChartGeometry | None] = {}
 
         def draw_notes(plt, y_top: float) -> None:
             for x, note in positioned:
@@ -5008,14 +5036,14 @@ class GHAExplorerApp(App):
                 plt.ylabel("Minutes")
 
             chart = render_plot(plot_trend, w, self._plot_height(0.5), p)
-            geom = chart_geometry(chart)
+            geoms[len(parts)] = chart_geometry(chart)
             parts.append(attach_note_markers(chart, [n for _, n in positioned], p.error_hex))
         except Exception:
             log.exception("Error rendering trend plot for %s", job_name)
             parts.append(f"[{p.error_hex}]Error rendering trend chart — see gha_explorer.log[/]")
 
         if is_pipeline:
-            body.set_content(parts, geom)
+            body.set_content(parts, geoms)
             return
 
         # Group member breakdown (matrix shards, renamed jobs) — only for multi-member groups
@@ -5058,6 +5086,7 @@ class GHAExplorerApp(App):
                     plt.ylabel("Minutes")
 
                 chart = render_plot(plot_shards, w, self._plot_height(0.4), p)
+                geoms[len(parts)] = chart_geometry(chart)  # same time axis: draggable too
                 parts.append(attach_note_markers(chart, [n for _, n in positioned], p.error_hex))
             except Exception:
                 log.exception("Error rendering shard plot for %s", job_name)
@@ -5084,7 +5113,7 @@ class GHAExplorerApp(App):
             log.exception("Error rendering step durations for %s", job_name)
             parts.append(f"[{p.error_hex}]Error rendering steps chart — see gha_explorer.log[/]")
 
-        body.set_content(parts, geom)
+        body.set_content(parts, geoms)
 
     # -- Runs tab --
 
