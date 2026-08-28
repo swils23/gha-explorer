@@ -2103,6 +2103,17 @@ def fmt_duration(seconds: float) -> str:
     return f"{m}m {s:02d}s" if m > 0 else f"{s}s"
 
 
+def _about_text() -> str:
+    """'gha-explorer 0.1.6 · Python 3.14.0 · Textual 8.2.8' for the Status tab."""
+    try:
+        from importlib.metadata import version as _v
+        textual_v = _v("textual")
+    except Exception:
+        textual_v = "?"
+    py = ".".join(str(n) for n in sys.version_info[:3])
+    return f"gha-explorer {__version__} · Python {py} · Textual {textual_v}"
+
+
 def fmt_elapsed(seconds: float) -> str:
     if seconds < 60:
         return f"{seconds:.0f}s"
@@ -3191,6 +3202,12 @@ class SettingsScreen(Screen[bool]):
         background: $panel;
         padding: 0 1;
     }
+    #settings-version {
+        width: auto;
+        height: 1;
+        color: $text-muted;
+        padding: 0 2;
+    }
     #settings-title {
         width: 1fr;
         height: 1;
@@ -3329,6 +3346,7 @@ class SettingsScreen(Screen[bool]):
     def compose(self) -> ComposeResult:
         with Horizontal(id="settings-top"):
             yield Static(f"Settings ({self.repo})", id="settings-title")
+            yield Static(f"gha-explorer {__version__}", id="settings-version")
             yield Button("Close  (Esc)", id="settings-close", compact=True)
         yield Tabs(
             Tab("General", id="general"), Tab("Groups", id="groups"), Tab("Workflows", id="workflows"),
@@ -4373,9 +4391,19 @@ class GHAExplorerApp(App):
     .card Static {
         height: auto;
     }
+    #log-title-row {
+        height: 1;
+    }
     #log-title {
+        width: 1fr;
         text-style: bold;
         color: $primary;
+    }
+    #status-version {
+        width: auto;
+        height: 1;
+        color: $text-muted;
+        padding: 0 1;
     }
     #log-view {
         height: 1fr;
@@ -4494,7 +4522,9 @@ class GHAExplorerApp(App):
                             yield Button("↻", id="cache-refresh", classes="card-refresh", compact=True,
                                          tooltip="Recount the cache now")
                         yield Static("", id="cache-details")
-                yield Label("Log  (INFO+ · full DEBUG log in gha_explorer.log)", id="log-title")
+                with Horizontal(id="log-title-row"):
+                    yield Label("Log  (INFO+ · full DEBUG log in gha_explorer.log)", id="log-title")
+                    yield Static(_about_text(), id="status-version")
                 yield RichLog(id="log-view", highlight=False, markup=False, wrap=True, max_lines=1000)
         yield Footer()
 
