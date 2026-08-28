@@ -317,6 +317,12 @@ class SyncStats:
     last_error: str = ""
     rate_limit: dict | None = None  # {"limit", "remaining", "reset", "used"} from gh api rate_limit
     rate_limit_checked_at: float | None = None
+    # First-sync panel: which steps ran, how long each took, what's left to estimate
+    first_load: bool = False
+    phase_started_at: float | None = None
+    step_elapsed: dict = field(default_factory=dict)  # phase -> seconds spent so far
+    listed_runs: int = 0        # runs found by the listing phase (this sync)
+    backfill_total: int = 0     # estimated number of 90-day windows to walk
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def reset_for_sync(self) -> None:
@@ -327,13 +333,24 @@ class SyncStats:
             self.new_runs = self.windows_done = 0
             self.current_window = ""
             self.started_at = time.monotonic()
+            self.phase_started_at = self.started_at
             self.finished_at = None
             self.last_error = ""
+            self.first_load = False
+            self.step_elapsed = {}
+            self.listed_runs = 0
+            self.backfill_total = 0
 
     def set_phase(self, phase: str, message: str = "") -> None:
         with self._lock:
+            now = time.monotonic()
+            if self.phase_started_at is not None:
+                self.step_elapsed[self.phase] = self.step_elapsed.get(self.phase, 0.0) + (now - self.phase_started_at)
+            if phase != self.phase:
+                self.done = self.total = 0  # progress counters belong to a phase
             self.phase = phase
             self.message = message
+            self.phase_started_at = now
         log.info("%s", message or phase)
 
     def set_progress(self, done: int, total: int) -> None:
@@ -342,7 +359,9 @@ class SyncStats:
 
     def snapshot(self) -> dict:
         with self._lock:
-            return {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
+            snap = {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
+            snap["step_elapsed"] = dict(self.step_elapsed)
+            return snap
 
 
 STATS = SyncStats()
@@ -829,9 +848,10 @@ def api_get(path: str, params: dict | None = None, **kw) -> object:
 
 
 def api_get_all(path: str, params: dict | None = None, *, list_key: str | None = None,
-                max_items: int | None = None) -> list:
+                max_items: int | None = None, on_page=None) -> list:
     """Follow `Link: rel=next` pagination. `list_key` unwraps envelope responses
-    like {"workflow_runs": [...]}; `max_items` stops early."""
+    like {"workflow_runs": [...]}; `max_items` stops early. `on_page(fetched, total)`
+    is called after each page with the envelope's `total_count` (None if absent)."""
     url: str | None = f"{GITHUB_API}/{path.lstrip('/')}"
     params = {**(params or {}), "per_page": 100}
     items: list = []
@@ -840,6 +860,8 @@ def api_get_all(path: str, params: dict | None = None, *, list_key: str | None =
         params = None  # the next link already carries the query string
         page = data.get(list_key, []) if list_key else data
         items.extend(page)
+        if on_page is not None:
+            on_page(len(items), data.get("total_count") if list_key else None)
         if max_items is not None and len(items) >= max_items:
             return items[:max_items]
         if list_key and not page:
@@ -1392,6 +1414,7 @@ def fetch_run_list(
     repo: str,
     since_date: str | None = None,
     until_date: str | None = None,
+    on_page=None,
 ) -> list[dict]:
     """One listing of successful runs (all workflows), newest-first.
 
@@ -1407,7 +1430,8 @@ def fetch_run_list(
         params["created"] = f">={since_date[:10]}"
     elif until_date:
         params["created"] = f"<={until_date[:10]}"
-    raw = api_get_all(f"repos/{repo}/actions/runs", params, list_key="workflow_runs", max_items=RUN_LIST_LIMIT)
+    raw = api_get_all(f"repos/{repo}/actions/runs", params, list_key="workflow_runs", max_items=RUN_LIST_LIMIT,
+                      on_page=on_page)
     return [
         {
             "databaseId": r["id"],
@@ -1426,18 +1450,31 @@ def fetch_run_list_complete(
     repo: str,
     since_date: str | None = None,
     until_date: str | None = None,
+    report_progress: bool = False,
 ) -> list[dict]:
     """Fetch every run in a window, walking backwards when the 1000 cap is hit.
 
-    `gh run list` silently truncates at 1000 newest runs. If a batch comes back
-    full, we move the upper bound down to the oldest day in that batch and go
-    again (bounds are inclusive, so we overlap that day and dedupe by id).
+    The API stops serving pages past 1000 results. If a batch comes back full, we
+    move the upper bound down to the oldest day in that batch and go again (bounds
+    are inclusive, so we overlap that day and dedupe by id).
+
+    With `report_progress`, STATS.done/total track runs listed vs the window's
+    `total_count` (known from the very first page), which is what makes the
+    first-sync progress bar and ETA possible.
     """
     seen: set[int] = set()
     out: list[dict] = []
     until = until_date
+    window_total: list[int | None] = [None]
+
+    def on_page(fetched_in_batch: int, total_count) -> None:
+        if window_total[0] is None and total_count:
+            window_total[0] = int(total_count)
+        total = window_total[0] or 0
+        STATS.set_progress(min(len(out) + fetched_in_batch, total) if total else len(out) + fetched_in_batch, total)
+
     while True:
-        batch = fetch_run_list(repo, since_date, until)
+        batch = fetch_run_list(repo, since_date, until, on_page=on_page if report_progress else None)
         fresh = [r for r in batch if r["databaseId"] not in seen]
         out.extend(fresh)
         seen.update(r["databaseId"] for r in fresh)
@@ -1549,6 +1586,12 @@ def _fetch_jobs_for_runs(repo: str, raw_runs: list[dict]) -> list[RunData]:
     if errors:
         log.warning("Completed with %d errors out of %d runs", errors, total)
     STATS.new_runs += len(runs)
+    elapsed = time.monotonic() - (STATS.phase_started_at or time.monotonic())
+    if total >= 50 and elapsed > 5:
+        try:  # remembered so the next first sync can estimate its duration up front
+            settings_set(GLOBAL_SCOPE, "detail_runs_per_s", round(total / elapsed, 2))
+        except Exception:
+            log.debug("Could not save fetch rate", exc_info=True)
     return runs
 
 
@@ -1705,6 +1748,7 @@ def fetch_incremental(repo: str, force_backfill: bool = False) -> list[RunData]:
     cached_runs = cache_load_all(repo)
     cached_ids = cache_get_all_ids(repo)
     log.info("Cache loaded for %s: %d runs (%d in DB)", repo, len(cached_runs), len(cached_ids))
+    STATS.first_load = not cached_runs
 
     new_runs: list[RunData] = []
 
@@ -1713,10 +1757,10 @@ def fetch_incremental(repo: str, force_backfill: bool = False) -> list[RunData]:
     if newest_date:
         STATS.set_phase("forward", f"Checking for new runs since {newest_date[:10]}...")
     else:
-        STATS.set_phase("forward", "Fetching runs (first load)...")
+        STATS.set_phase("forward", "Listing every successful workflow run (first sync)...")
 
     try:
-        forward_raw = fetch_run_list_complete(repo, since_date=newest_date)
+        forward_raw = fetch_run_list_complete(repo, since_date=newest_date, report_progress=True)
     except AuthError:
         raise
     except GitHubAPIError:
@@ -1725,11 +1769,12 @@ def fetch_incremental(repo: str, force_backfill: bool = False) -> list[RunData]:
         STATS.finished_at = time.monotonic()
         return cached_runs
 
+    STATS.listed_runs = len(forward_raw)
     forward_new = [r for r in forward_raw if r["databaseId"] not in cached_ids]
     log.info("Forward fetch: %d listed, %d new", len(forward_raw), len(forward_new))
 
     if forward_new:
-        STATS.set_phase("details", f"Fetching details for {len(forward_new)} new runs...")
+        STATS.set_phase("details", f"Fetching job timings for {len(forward_new):,} runs...")
         new_runs.extend(_fetch_jobs_for_runs(repo, forward_new))
         cached_ids.update(r.run_id for r in new_runs)
 
@@ -1753,7 +1798,9 @@ def fetch_incremental(repo: str, force_backfill: bool = False) -> list[RunData]:
         STATS.set_phase("gaps", f"Checking gap {label}...")
         try:
             gap_raw = fetch_run_list_complete(repo, since_date=a.isoformat(), until_date=b.isoformat())
-        except subprocess.CalledProcessError:
+        except AuthError:
+            raise
+        except GitHubAPIError:
             log.warning("Gap check %s failed — likely rate limited; will retry next launch", label)
             break
         gap_new = [r for r in gap_raw if r["databaseId"] not in cached_ids]
@@ -1777,13 +1824,16 @@ def fetch_incremental(repo: str, force_backfill: bool = False) -> list[RunData]:
         repo_created = fetch_repo_created_at(repo)
         if repo_created:
             log.info("Repo created %s — backfilling to there", repo_created.date())
+            STATS.backfill_total = max(1, -(-max(0, (oldest_date - repo_created).days) // BACKFILL_WINDOW_DAYS))
         window_end = oldest_date
         reached_floor = False
         for _ in range(MAX_BACKFILL_WINDOWS):
             window_start = window_end - timedelta(days=BACKFILL_WINDOW_DAYS)
             label = f"{window_start:%Y-%m-%d} → {window_end:%Y-%m-%d}"
             STATS.current_window = label
-            STATS.set_phase("backfill", f"Backfilling {label}...")
+            verb = "Checking older history" if STATS.first_load else "Backfilling"
+            STATS.set_phase("backfill", f"{verb} {label}...")
+            STATS.set_progress(STATS.windows_done, STATS.backfill_total)
 
             try:
                 backfill_raw = fetch_run_list_complete(
@@ -4326,11 +4376,15 @@ class GHAExplorerApp(App):
         return f"{len(runs)} runs ({oldest} → {newest})"
 
     def _activity_text(self, s: dict) -> str:
-        if s["phase"] == "details" and s["total"]:
-            pct = min(100, int(s["done"] / s["total"] * 100))
-            filled = int(min(s["done"], s["total"]) / s["total"] * 20)
+        labels = {"details": "Fetching job timings", "forward": "Listing runs", "backfill": "Checking older history"}
+        if s["phase"] in labels and s["total"]:
+            done, total = min(s["done"], s["total"]), s["total"]
+            pct = int(done / total * 100)
+            filled = int(done / total * 20)
             bar = "━" * filled + "╌" * (20 - filled)
-            return f"Fetching runs  {bar}  {pct}% ({s['done']}/{s['total']})"
+            eta = self._phase_eta(s)
+            tail = f" · ~{fmt_elapsed(eta)} left" if eta else ""
+            return f"{labels[s['phase']]}  {bar}  {pct}% ({done:,}/{total:,}){tail}"
         return s["message"] or ("Syncing..." if self.loading else "Idle")
 
     def _tick(self) -> None:
@@ -4340,9 +4394,184 @@ class GHAExplorerApp(App):
             s = STATS.snapshot()
             if self.loading:
                 self._update_status_bar(self._cache_status_text(), self._activity_text(s))
+                if not self.runs and self.current_repo:
+                    self._render_first_sync_panel(s)
             self._render_status(s)
         except Exception:
             log.debug("tick error", exc_info=True)
+
+    # -- First-sync panel (main pane, while a repo has no cached data yet) --
+
+    FIRST_SYNC_STEPS = (
+        ("cache", "Load local cache"),
+        ("forward", "List workflow runs"),
+        ("details", "Fetch job timings"),
+        ("backfill", "Check older history"),
+    )
+    DEFAULT_PAGE_SECONDS = 2.3     # one /actions/runs page of 100 (measured; GitHub is slow here)
+    DEFAULT_DETAIL_RUNS_PER_S = 12  # jobs requests with MAX_WORKERS in flight, until measured
+
+    @staticmethod
+    def _phase_elapsed(s: dict) -> float:
+        return max(0.0, time.monotonic() - (s.get("phase_started_at") or time.monotonic()))
+
+    def _phase_eta(self, s: dict) -> float | None:
+        """Seconds left in the current phase from its measured rate, or None if too early to say."""
+        done, total = s["done"], s["total"]
+        elapsed = self._phase_elapsed(s)
+        if not total or done <= 0 or elapsed < 2:
+            return None
+        return max(0.0, (total - done) * elapsed / done)
+
+    def _first_sync_step_index(self, s: dict) -> int:
+        phase = s["phase"]
+        if phase in ("done", "error", "rate-limited"):
+            return len(self.FIRST_SYNC_STEPS)
+        if phase == "details" and "backfill" in s["step_elapsed"]:
+            return 3  # job timings for runs found while checking older history
+        if phase == "gaps":
+            return 3
+        return {"cache": 0, "forward": 1, "details": 2, "backfill": 3}.get(phase, 0)
+
+    def _render_first_sync_panel(self, s: dict) -> None:
+        body = self.query_one("#trends-body", TrendChart)
+        p = self.palette
+        width = min(self._content_width() - 2, 96)
+        now = time.monotonic()
+        total_elapsed = now - (s["started_at"] or now)
+        current = self._first_sync_step_index(s)
+        phase_elapsed = self._phase_elapsed(s)
+        done, total = s["done"], s["total"]
+
+        # -- rates: measured in-phase when possible, else remembered / default
+        page_s = self.DEFAULT_PAGE_SECONDS
+        if s["phase"] == "forward" and done >= 100 and phase_elapsed > 2:
+            page_s = phase_elapsed / max(1, -(-done // 100))
+        elif s["step_elapsed"].get("forward") and s["listed_runs"] >= 100:
+            page_s = s["step_elapsed"]["forward"] / max(1, -(-s["listed_runs"] // 100))
+        detail_rate = float(settings_get(GLOBAL_SCOPE, "detail_runs_per_s", 0) or 0) or self.DEFAULT_DETAIL_RUNS_PER_S
+        if s["phase"] == "details" and current == 2 and done >= 20 and phase_elapsed >= 3:
+            detail_rate = done / phase_elapsed
+
+        # -- how many runs are we talking about?
+        runs_known = s["listed_runs"] or (total if s["phase"] == "forward" else 0)
+
+        # -- remaining time: rest of the current step + full estimates of pending steps
+        remaining: float | None = 0.0
+        step_eta: dict[str, float | None] = {}
+        for idx, (key, _label) in enumerate(self.FIRST_SYNC_STEPS):
+            if idx < current:
+                continue
+            if idx == current:
+                eta = self._phase_eta(s)
+                if eta is None and key == "forward" and total:
+                    eta = max(0.0, -(-(total - done) // 100) * page_s)
+                elif eta is None and key == "details" and total:
+                    eta = (total - done) / detail_rate
+                elif eta is None and key == "backfill" and s["backfill_total"]:
+                    eta = max(0, s["backfill_total"] - s["windows_done"]) * page_s
+                step_eta[key] = eta
+            else:
+                if key == "forward":
+                    step_eta[key] = None
+                elif key == "details":
+                    step_eta[key] = (runs_known / detail_rate) if runs_known else None
+                elif key == "backfill":
+                    step_eta[key] = (s["backfill_total"] or 5) * page_s
+                else:
+                    step_eta[key] = 0.0
+            if remaining is not None:
+                remaining = None if step_eta[key] is None else remaining + step_eta[key]
+
+        # -- header
+        out = RichText()
+        out.append(f"First sync of {self.current_repo}", style=f"bold {p.primary_hex}")
+        out.append(f"   elapsed {fmt_elapsed(total_elapsed)}", style=p.muted_hex)
+        if remaining is not None and current < len(self.FIRST_SYNC_STEPS):
+            out.append(f"   ·   about {fmt_elapsed(remaining) if remaining >= 10 else 'a few seconds'} left",
+                       style=p.muted_hex)
+        out.append("\n")
+        out.append(
+            f"GitHub's API hands out 100 runs per request (about {max(page_s, 0.5):.1f} s each), and every run needs one more "
+            f"request for its job timings ({MAX_WORKERS} in flight at a time). Everything lands in the local SQLite "
+            "cache, so this full pass happens once per repository — later launches fetch only new runs and show "
+            "charts immediately.\n\n",
+            style=p.muted_hex,
+        )
+
+        # -- steps
+        for idx, (key, label) in enumerate(self.FIRST_SYNC_STEPS):
+            if idx < current:
+                glyph, style = "✓", p.success_hex
+            elif idx == current:
+                glyph, style = "▶", p.primary_hex
+            else:
+                glyph, style = "·", p.muted_hex
+            out.append(f"  {glyph}  ", style=f"bold {style}")
+            out.append(f"{label:<22}", style=("bold " if idx == current else "") + (style if idx <= current else p.muted_hex))
+            out.append(self._first_sync_step_detail(key, idx, current, s, step_eta.get(key), page_s, detail_rate),
+                       style=p.muted_hex if idx != current else "")
+            out.append("\n")
+
+        # -- overall bar: elapsed vs elapsed + remaining
+        if current >= len(self.FIRST_SYNC_STEPS):
+            frac = 1.0
+        elif remaining is None:
+            frac = None
+        else:
+            frac = total_elapsed / (total_elapsed + remaining) if (total_elapsed + remaining) > 0 else 0.0
+        bar_w = max(20, width - 10)
+        out.append("\n  ")
+        if frac is None:
+            out.append("╌" * bar_w, style="#3A3450")
+            out.append("  estimating…", style=p.muted_hex)
+        else:
+            filled = int(round(min(1.0, frac) * bar_w))
+            out.append("━" * filled, style=p.primary_hex)
+            out.append("╌" * (bar_w - filled), style="#3A3450")
+            out.append(f"  {int(min(1.0, frac) * 100):>3}%", style="bold")
+        out.append("\n")
+        if s["phase"] in ("rate-limited", "error"):
+            out.append(f"\n  {s['message']}", style=p.warning_hex if s["phase"] == "rate-limited" else p.error_hex)
+        elif s["message"]:
+            out.append(f"\n  {s['message']}", style=p.muted_hex)
+        body.set_message(out)
+
+    def _first_sync_step_detail(self, key: str, idx: int, current: int, s: dict, eta: float | None,
+                                page_s: float, detail_rate: float) -> str:
+        done, total = s["done"], s["total"]
+        spent = s["step_elapsed"].get(key, 0.0)
+        left = f" · ~{fmt_elapsed(eta)} left" if eta and eta >= 5 else ""
+        if key == "cache":
+            return "nothing cached for this repository yet" if idx <= current else ""
+        if key == "forward":
+            if idx < current:
+                return f"{s['listed_runs']:,} runs found in {fmt_elapsed(spent)}"
+            if idx == current:
+                if total:
+                    return f"{min(done, total):,} of {total:,} runs · page {max(1, -(-done // 100))} of {-(-total // 100)}{left}"
+                return "asking GitHub how many runs there are…"
+            return "100 runs per request"
+        if key == "details":
+            if idx < current:
+                return f"{s['new_runs']:,} runs in {fmt_elapsed(spent)}"
+            if idx == current:
+                rate = f" · {detail_rate:.0f} runs/s" if done >= 20 else ""
+                return f"{min(done, total):,} of {total:,} runs{rate}{left}" if total else "starting…"
+            runs = s["listed_runs"] or (total if s["phase"] == "forward" else 0)
+            if runs:
+                return f"~{fmt_elapsed(runs / detail_rate)} for {runs:,} runs, {MAX_WORKERS} requests at a time"
+            return f"one request per run, {MAX_WORKERS} at a time"
+        if key == "backfill":
+            if idx < current:
+                return f"{s['windows_done']} window{'s' if s['windows_done'] != 1 else ''} in {fmt_elapsed(spent)}"
+            if idx == current:
+                win = f" · {s['current_window']}" if s["current_window"] else ""
+                if s["backfill_total"]:
+                    return f"window {min(s['windows_done'] + 1, s['backfill_total'])} of ~{s['backfill_total']}{win}{left}"
+                return f"looking up when the repository was created{win}"
+            return f"back to the repository's creation date, {BACKFILL_WINDOW_DAYS} days per request"
+        return ""
 
     def _drain_logs(self) -> None:
         view = self.query_one("#log-view", RichLog)
