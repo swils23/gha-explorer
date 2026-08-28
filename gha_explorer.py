@@ -244,6 +244,12 @@ GHA_THEME = Theme(
         "scrollbar": "#3A3450",
         "scrollbar-hover": LAVENDER["secondary"],
         "scrollbar-active": LAVENDER["primary"],
+        # Track = pane background. Terminal fonts whose █ doesn't fill the cell leave a
+        # sliver of track colour beside the thumb, which reads as a second, offset bar.
+        "scrollbar-background": LAVENDER["background"],
+        "scrollbar-background-hover": LAVENDER["background"],
+        "scrollbar-background-active": LAVENDER["background"],
+        "scrollbar-corner-color": LAVENDER["background"],
         "input-cursor-background": LAVENDER["primary"],
         "input-selection-background": "#8B7AD9 35%",
         "link-color": LAVENDER["accent"],
@@ -4246,6 +4252,13 @@ class GHAExplorerApp(App):
     Screen {
         background: $background;
         layers: base toggles notes;
+    }
+    /* Same for any --theme: an invisible track so only the thumb is drawn. */
+    * {
+        scrollbar-background: $background;
+        scrollbar-background-hover: $background;
+        scrollbar-background-active: $background;
+        scrollbar-corner-color: $background;
     }
     #trends-header {
         height: 1;
