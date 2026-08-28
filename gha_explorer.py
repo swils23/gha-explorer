@@ -326,6 +326,12 @@ class SyncStats:
     step_elapsed: dict = field(default_factory=dict)  # phase -> seconds spent so far
     listed_runs: int = 0        # runs found by the listing phase (this sync)
     backfill_total: int = 0     # estimated number of 90-day windows to walk
+    # Budget cap: a normal sync spends at most half the hour's remaining requests on
+    # job timings (newest runs first); what doesn't fit is deferred to the next sync.
+    detail_budget: int | None = None   # None = uncapped (shift+R)
+    detail_budget_left: int = 0
+    deferred_runs: int = 0
+    resume_at: float | None = None      # epoch: when the deferred remainder can continue
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def reset_for_sync(self) -> None:
@@ -343,6 +349,10 @@ class SyncStats:
             self.step_elapsed = {}
             self.listed_runs = 0
             self.backfill_total = 0
+            self.detail_budget = None
+            self.detail_budget_left = 0
+            self.deferred_runs = 0
+            self.resume_at = None
 
     def set_phase(self, phase: str, message: str = "") -> None:
         with self._lock:
@@ -827,7 +837,7 @@ def auth_status_text() -> str:
 
 
 def _api_request(url: str, params: dict | None = None, *, retries: int = 4, count: bool = True,
-                 token: str | None = None) -> tuple[object, object]:
+                 token: str | None = None, wait_for_reset: bool = True) -> tuple[object, object]:
     """GET one URL. Returns (parsed JSON, response headers).
 
     Retries with backoff on network errors and on secondary rate limits (Retry-After);
@@ -875,6 +885,8 @@ def _api_request(url: str, params: dict | None = None, *, retries: int = 4, coun
             if rate_limited and remaining == "0" and not retry_after:
                 # Primary limit: the hour's budget is spent. Wait for the reset and carry on —
                 # a first sync of a big repo needs more than 5,000 requests, so this is normal.
+                if not wait_for_reset:
+                    raise RateLimitError(f"API budget spent — resets {fmt_reset(int(exc.headers.get('X-RateLimit-Reset', '0') or 0))}") from None
                 STATS.rate_limit_retries += 1
                 _wait_for_rate_limit_reset(int(exc.headers.get("X-RateLimit-Reset", "0") or 0), url)
                 continue  # doesn't count as an attempt
@@ -1618,6 +1630,32 @@ def _fetch_and_build(repo: str, raw_run: dict, retries: int = 2) -> RunData:
     raise RuntimeError("unreachable")
 
 
+def _set_details_budget(force: bool) -> None:
+    """Decide how many job-timing requests this sync may make: half of what is left in
+    the hour's budget (known from the listing's response headers), so charts appear
+    this hour and other tools keep working. shift+R lifts the cap (waits for resets)."""
+    view = None if force else rate_limit_view(STATS.snapshot())
+    if view is None:
+        STATS.detail_budget, STATS.detail_budget_left = None, 0
+        return
+    STATS.detail_budget = STATS.detail_budget_left = max(0, view["remaining"] // 2)
+    STATS.resume_at = view.get("reset")
+    log.info("Job-timing budget for this sync: %d requests (half of %d remaining)", STATS.detail_budget, view["remaining"])
+
+
+def _take_within_budget(raw_runs: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split newest-first runs into (fetch now, defer). One request per run."""
+    if STATS.detail_budget is None:
+        return raw_runs, []
+    n = max(0, STATS.detail_budget_left)
+    take, defer = raw_runs[:n], raw_runs[n:]
+    STATS.detail_budget_left -= len(take)
+    if defer:
+        STATS.deferred_runs += len(defer)
+        log.info("Deferring %d runs to stay within the API budget (%d deferred so far)", len(defer), STATS.deferred_runs)
+    return take, defer
+
+
 def _fetch_jobs_for_runs(repo: str, raw_runs: list[dict]) -> list[RunData]:
     """Fetch job details for a list of raw runs using ThreadPoolExecutor."""
     runs: list[RunData] = []
@@ -1836,6 +1874,8 @@ def fetch_incremental(repo: str, force_backfill: bool = False) -> list[RunData]:
     STATS.listed_runs = len(forward_raw)
     forward_new = [r for r in forward_raw if r["databaseId"] not in cached_ids]
     log.info("Forward fetch: %d listed, %d new", len(forward_raw), len(forward_new))
+    _set_details_budget(force_backfill)
+    forward_new, _deferred = _take_within_budget(forward_new)  # newest-first, so we keep the recent end
 
     if forward_new:
         STATS.set_phase("details", f"Fetching job timings for {len(forward_new):,} runs...")
@@ -1856,6 +1896,8 @@ def fetch_incremental(repo: str, force_backfill: bool = False) -> list[RunData]:
         (a, b) for a, b in zip(known, known[1:])
         if (b - a) >= timedelta(days=GAP_DAYS) and (a.date().isoformat(), b.date().isoformat()) not in verified
     ]
+    if STATS.deferred_runs:
+        gaps = []  # older history is knowingly incomplete this sync; don't spend budget on it
     if gaps:
         log.info("Checking %d gap(s) of %d+ days in cached history", len(gaps), GAP_DAYS)
     for a, b in gaps:
@@ -1885,6 +1927,9 @@ def fetch_incremental(repo: str, force_backfill: bool = False) -> list[RunData]:
         new_runs.sort(key=lambda r: r.created_at)
         oldest_date = new_runs[0].created_at
 
+    if STATS.deferred_runs or (STATS.detail_budget is not None and STATS.detail_budget_left <= 0):
+        backfill_done = True  # out of budget for this sync; the next one continues from the oldest cached run
+        log.info("Skipping older history this sync — API budget for job timings is used up")
     if oldest_date and not backfill_done:
         repo_created = fetch_repo_created_at(repo)
         if repo_created:
@@ -1915,11 +1960,15 @@ def fetch_incremental(repo: str, force_backfill: bool = False) -> list[RunData]:
             STATS.windows_done += 1
             log.info("Backfill window %s: %d listed, %d new", label, len(backfill_raw), len(backfill_new))
 
+            backfill_new, deferred_here = _take_within_budget(backfill_new)
             if backfill_new:
                 STATS.set_phase("details", f"Fetching details for {len(backfill_new)} older runs...")
                 backfill_runs = _fetch_jobs_for_runs(repo, backfill_new)
                 new_runs.extend(backfill_runs)
                 cached_ids.update(r.run_id for r in backfill_runs)
+            if deferred_here:
+                log.info("Older history paused at %s — API budget for this sync is used up", label)
+                break
 
             if repo_created is not None:
                 if window_start <= repo_created:
@@ -1948,7 +1997,11 @@ def fetch_incremental(repo: str, force_backfill: bool = False) -> list[RunData]:
     meta_set(repo)
 
     if STATS.phase != "rate-limited":
-        if total_new:
+        if STATS.deferred_runs:
+            when = f" — continues at {fmt_reset(STATS.resume_at)}" if STATS.resume_at else ""
+            STATS.set_phase("done", f"+{total_new:,} runs fetched · {STATS.deferred_runs:,} older runs deferred "
+                                    f"to save API budget{when}")
+        elif total_new:
             STATS.set_phase("done", f"+{total_new} new runs fetched — {len(all_runs)} total")
         else:
             STATS.set_phase("done", f"Up to date — {len(all_runs)} runs")
@@ -4137,13 +4190,17 @@ class GHAExplorerApp(App):
         padding: 0 1;
     }
     #settings-button {
-        width: auto;
+        min-width: 3;
+        width: 3;
         height: 1;
-        color: $primary;
-        padding: 0 1;
+        margin-right: 1;
+        background: $primary;
+        color: $background;
+        text-style: bold;
     }
     #settings-button:hover {
-        text-style: reverse;
+        background: $primary-lighten-2;
+        color: $background;
     }
     #content {
         height: 1fr;
@@ -4166,7 +4223,7 @@ class GHAExplorerApp(App):
         padding: 0 1;
     }
     .sidebar-strip {
-        width: 3;
+        width: 1;  /* just the divider line; the > toggle sits on it at the bottom */
         height: 1fr;
         border-right: solid $secondary;
         background: $surface;
@@ -4177,22 +4234,16 @@ class GHAExplorerApp(App):
     .sidebar-toggle {
         layer: toggles;
         dock: bottom;
-        min-width: 5;
-        width: 5;
-        height: 3;
-        border: round $primary;
-        background: $surface;
-        color: $primary;
+        min-width: 3;
+        width: 3;
+        height: 1;
+        background: $primary;
+        color: $background;
         text-style: bold;
     }
     .sidebar-toggle:hover {
-        background: $primary 30%;
-        color: $text;
-        border: round $primary;
-    }
-    .sidebar-toggle:focus {
-        border: round $primary;
-        text-style: bold;
+        background: $primary-lighten-2;
+        color: $background;
     }
 
     /* Status tab */
@@ -4217,6 +4268,23 @@ class GHAExplorerApp(App):
     .card-title {
         text-style: bold;
         color: $primary;
+        width: 1fr;
+    }
+    .card-title-row {
+        height: 1;
+    }
+    .card-refresh {
+        min-width: 3;
+        width: 3;
+        height: 1;
+        padding: 0;
+        border: none;
+        background: transparent;
+        color: $primary;
+    }
+    .card-refresh:hover {
+        background: $primary 30%;
+        color: $text;
     }
     .card Static {
         height: auto;
@@ -4300,12 +4368,12 @@ class GHAExplorerApp(App):
             yield Tabs(Tab("Trends", id="trends"), Tab("Runs", id="runs-tab"), Tab("Status", id="status-tab"), id="tabs")
             yield Static("Loading...", id="status-bar")
             yield Static("", id="repo-label")
-            yield Static("[@click=app.open_settings]⚙ Settings[/]", id="settings-button")
+            yield Button("⚙", id="settings-button", compact=True, tooltip="Settings (,)")
         with ContentSwitcher(initial="trends", id="content"):
             with Horizontal(id="trends"):
                 yield Vertical(classes="sidebar-strip")
                 yield FilterSidebar()
-                yield Button("<", classes="sidebar-toggle")
+                yield Button("<", classes="sidebar-toggle", compact=True)
                 with Vertical(classes="tab-body"):
                     with Horizontal(id="trends-header"):
                         yield Static("", id="trends-stats")
@@ -4315,7 +4383,7 @@ class GHAExplorerApp(App):
             with Horizontal(id="runs-tab"):
                 yield Vertical(classes="sidebar-strip")
                 yield FilterSidebar()
-                yield Button("<", classes="sidebar-toggle")
+                yield Button("<", classes="sidebar-toggle", compact=True)
                 yield DataTable(id="runs-table", classes="tab-body")
             with Vertical(id="status-tab", classes="status-pane"):
                 with Horizontal(id="status-cards"):
@@ -4325,12 +4393,18 @@ class GHAExplorerApp(App):
                         yield Gauge("Progress", id="sync-progress")
                         yield Static("", id="sync-details")
                     with Vertical(classes="card", id="card-api"):
-                        yield Label("GitHub API", classes="card-title")
+                        with Horizontal(classes="card-title-row"):
+                            yield Label("GitHub API", classes="card-title")
+                            yield Button("↻", id="api-refresh", classes="card-refresh", compact=True,
+                                         tooltip="Re-check the budget now (one request)")
                         yield Static("", id="api-status")
                         yield Gauge("Remaining", id="rate-gauge")
                         yield Static("", id="api-details")
                     with Vertical(classes="card", id="card-cache"):
-                        yield Label("Cache", classes="card-title")
+                        with Horizontal(classes="card-title-row"):
+                            yield Label("Cache", classes="card-title")
+                            yield Button("↻", id="cache-refresh", classes="card-refresh", compact=True,
+                                         tooltip="Recount the cache now")
                         yield Static("", id="cache-details")
                 yield Label("Log  (INFO+ · full DEBUG log in gha_explorer.log)", id="log-title")
                 yield RichLog(id="log-view", highlight=False, markup=False, wrap=True, max_lines=1000)
@@ -4532,7 +4606,29 @@ class GHAExplorerApp(App):
             return 3
         return {"cache": 0, "forward": 1, "details": 2, "backfill": 3}.get(phase, 0)
 
+    def _enter_first_sync_layout(self) -> None:
+        """Give the first-sync panel the whole pane: collapse the filters (they're empty
+        anyway) and hide Add note. Undone by _leave_first_sync_layout once data lands."""
+        if getattr(self, "_first_sync_layout", False):
+            return
+        self._first_sync_layout = True
+        self._sidebar_was_visible = self._sidebar_visible
+        if self._sidebar_visible:
+            self._sidebar_visible = False
+            self._apply_sidebar_visibility()  # not persisted: this is temporary
+        self.query_one("#notes-button", Static).display = False
+
+    def _leave_first_sync_layout(self) -> None:
+        if not getattr(self, "_first_sync_layout", False):
+            return
+        self._first_sync_layout = False
+        self.query_one("#notes-button", Static).display = True
+        if getattr(self, "_sidebar_was_visible", False) and not self._sidebar_visible:
+            self._sidebar_visible = True
+            self._apply_sidebar_visibility()
+
     def _render_first_sync_panel(self, s: dict) -> None:
+        self._enter_first_sync_layout()
         body = self.query_one("#trends-body", TrendChart)
         p = self.palette
         width = min(self._content_width() - 2, 96)
@@ -4593,6 +4689,8 @@ class GHAExplorerApp(App):
                 reqs_left += max(0, (total - done) if current == 2 else runs_known)
             reqs_left += max(0, (s["backfill_total"] or 5) - (s["windows_done"] if current == 3 else 0))
             avail = rl["remaining"]
+            if s.get("detail_budget") is not None:
+                reqs_left = 0  # capped sync: it never exceeds the budget; deferral is shown on the steps instead
             if reqs_left > avail and remaining is not None:
                 reset_in = max(0.0, (rl.get("reset") or time.time()) - time.time())
                 waits = 1 + (reqs_left - avail - 1) // rl["limit"]
@@ -4679,16 +4777,21 @@ class GHAExplorerApp(App):
                 return "asking GitHub how many runs there are…"
             return "100 runs per request"
         if key == "details":
+            capped = f" (newest {total:,} of {s['listed_runs']:,} — half this hour's API budget)" \
+                if s.get("deferred_runs") and total and s.get("listed_runs") else ""
             if idx < current:
-                return f"{s['new_runs']:,} runs in {fmt_elapsed(spent)}"
+                return f"{s['new_runs']:,} runs in {fmt_elapsed(spent)}{capped}"
             if idx == current:
                 rate = f" · {detail_rate:.0f} runs/s" if done >= 20 else ""
-                return f"{min(done, total):,} of {total:,} runs{rate}{left}" if total else "starting…"
+                return f"{min(done, total):,} of {total:,} runs{rate}{left}{capped}" if total else "starting…"
             runs = s["listed_runs"] or (total if s["phase"] == "forward" else 0)
             if runs:
                 return f"~{fmt_elapsed(runs / detail_rate)} for {runs:,} runs, {MAX_WORKERS} requests at a time"
             return f"one request per run, {MAX_WORKERS} at a time"
         if key == "backfill":
+            if s.get("deferred_runs"):
+                when = f" at {fmt_reset(s['resume_at'])}" if s.get("resume_at") else " on the next sync"
+                return f"{s['deferred_runs']:,} older runs deferred to save API budget — continues{when}"
             if idx < current:
                 return f"{s['windows_done']} window{'s' if s['windows_done'] != 1 else ''} in {fmt_elapsed(spent)}"
             if idx == current:
@@ -4863,13 +4966,60 @@ class GHAExplorerApp(App):
             self._update_status_bar(self._cache_status_text(), STATS.message or "Up to date")
             self._populate_sidebar()
             self._render_status(STATS.snapshot())
+            if data:
+                self._leave_first_sync_layout()
             self.set_timer(0.1, self._render_all_tabs)
+            self._schedule_resume()
         except Exception:
             log.exception("Error in _data_loaded")
+
+    @on(Button.Pressed, "#settings-button")
+    def _on_settings_button(self, event: Button.Pressed) -> None:
+        event.stop()
+        self.action_open_settings()
+
+    @on(Button.Pressed, "#api-refresh")
+    def _on_api_refresh(self, event: Button.Pressed) -> None:
+        event.stop()
+        self._probe_api_budget()
+
+    @work(thread=True, exclusive=True, group="budget-probe", exit_on_error=False)
+    def _probe_api_budget(self) -> None:
+        """One cheap authenticated request; its headers refresh the budget everywhere."""
+        try:
+            _api_request(f"{GITHUB_API}/user", retries=0, count=False, wait_for_reset=False)
+        except GitHubAPIError as exc:
+            log.debug("Budget probe: %s", exc)  # a 403 still carried fresh headers
+
+    @on(Button.Pressed, "#cache-refresh")
+    def _on_cache_refresh(self, event: Button.Pressed) -> None:
+        event.stop()
+        self._cache_card_drawn = False  # the next tick recounts
+
+    def _schedule_resume(self) -> None:
+        """Runs were deferred to stay within the API budget: pick them up once the
+        hour's window resets (plus a little slack)."""
+        timer = getattr(self, "_resume_timer", None)
+        if timer is not None:
+            timer.stop()
+            self._resume_timer = None
+        if not STATS.deferred_runs or STATS.resume_at is None:
+            return
+        delay = max(15.0, STATS.resume_at - time.time() + 15)
+        self._resume_timer = self.set_timer(delay, self._auto_resume)
+        log.info("Will continue fetching %d deferred runs at %s", STATS.deferred_runs, fmt_reset(STATS.resume_at))
+
+    def _auto_resume(self) -> None:
+        self._resume_timer = None
+        if self.loading or not self.current_repo:
+            return
+        self.notify("API budget reset — continuing with older history.", timeout=5)
+        self._start_fetch()
 
     def _data_error(self, error: str) -> None:
         try:
             self.loading = False
+            self._leave_first_sync_layout()
             STATS.phase = "error"
             STATS.message = error[-120:]
             STATS.finished_at = time.monotonic()
@@ -5137,7 +5287,7 @@ class GHAExplorerApp(App):
             tabs.styles.width = total
 
     SIDEBAR_WIDTH = 30  # FilterSidebar CSS width, border included
-    STRIP_WIDTH = 3     # .sidebar-strip width when collapsed
+    STRIP_WIDTH = 1     # .sidebar-strip width when collapsed (the divider line only)
 
     def _apply_sidebar_visibility(self) -> None:
         visible = self._sidebar_visible
@@ -5145,12 +5295,12 @@ class GHAExplorerApp(App):
             sidebar.display = visible
         for strip in self.query(".sidebar-strip"):
             strip.display = not visible
-        # Centre the 5-wide toggle on the border line: line at (width - 1), glyph at offset + 2.
-        line_x = (self.SIDEBAR_WIDTH if visible else self.STRIP_WIDTH) - 1
+        # Expanded: centre the 3-wide "<" on the sidebar's border line (col width-1).
+        # Collapsed: the gutter is one column, so ">" starts at the left edge.
         for btn in self.query(".sidebar-toggle"):
             btn.label = "<" if visible else ">"
             btn.tooltip = "Collapse filters (f)" if visible else "Show filters (f)"
-            btn.styles.offset = (line_x - 2, 0)
+            btn.styles.offset = (self.SIDEBAR_WIDTH - 2 if visible else 0, 0)
 
     @on(Button.Pressed, ".sidebar-toggle")
     def _on_sidebar_button(self, event: Button.Pressed) -> None:
@@ -5159,6 +5309,7 @@ class GHAExplorerApp(App):
 
     def action_toggle_sidebar(self) -> None:
         """Collapse/expand the filter sidebar (persisted across launches)."""
+        self._sidebar_was_visible = not self._sidebar_visible  # respect a manual choice made mid first-sync
         self._sidebar_visible = not self._sidebar_visible
         self._apply_sidebar_visibility()
         settings_set(GLOBAL_SCOPE, "sidebar_visible", self._sidebar_visible)
