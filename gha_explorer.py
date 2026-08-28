@@ -1308,6 +1308,36 @@ def parse_note_when(raw: str) -> datetime | None:
     return None
 
 
+_workflow_names: dict[str, dict[int, str]] = {}  # repo -> {workflow_id: workflow name}
+
+
+def workflow_name_for(repo: str, workflow_id: int | None, fallback: str) -> str:
+    """Resolve a run's workflow *name* from its workflow_id, the way `gh run list`
+    did. A run's own `name` is the run title (Dependabot titles its runs after the
+    PR, `run-name:` can be anything), so it is only a last resort.
+
+    The repo's workflow list is loaded once; ids missing from it (renamed or
+    deleted workflows) are looked up individually and cached.
+    """
+    if workflow_id is None:
+        return fallback
+    names = _workflow_names.setdefault(repo, {})
+    if not names:
+        try:
+            for wf in api_get_all(f"repos/{repo}/actions/workflows", list_key="workflows"):
+                names[int(wf["id"])] = wf.get("name") or fallback
+        except Exception:
+            log.debug("Could not list workflows for %s", repo, exc_info=True)
+    if workflow_id not in names:
+        try:
+            data, _ = _api_request(f"{GITHUB_API}/repos/{repo}/actions/workflows/{workflow_id}", None)
+            names[workflow_id] = data.get("name") or fallback
+        except Exception:
+            log.debug("Could not look up workflow %s for %s", workflow_id, repo, exc_info=True)
+            names[workflow_id] = fallback
+    return names[workflow_id]
+
+
 def fetch_run_list(
     repo: str,
     since_date: str | None = None,
@@ -1335,7 +1365,8 @@ def fetch_run_list(
             "headBranch": r.get("head_branch") or "",
             "conclusion": r.get("conclusion"),
             "createdAt": r.get("created_at") or "",
-            "workflowName": r.get("name") or "",
+            "workflowName": workflow_name_for(repo, r.get("workflow_id"), r.get("name") or ""),
+            "workflowId": r.get("workflow_id"),
         }
         for r in raw
     ]
@@ -1471,6 +1502,50 @@ def _fetch_jobs_for_runs(repo: str, raw_runs: list[dict]) -> list[RunData]:
     return runs
 
 
+REST_NAME_BUG_SINCE = "2026-08-27T18:00"  # first REST-path build stored run titles as workflow names
+
+
+def repair_rest_workflow_names(repo: str) -> int:
+    """Re-label runs cached by the first REST-path build, which stored the *run*
+    title as the workflow name (Dependabot runs then showed up as workflows named
+    after their PRs). Affected rows are recognisable: fetched after the cutover
+    and without a workflowId. Their date range is re-listed and names rewritten;
+    once every row carries a workflowId this is a no-op."""
+    conn = _cache_conn()
+    rows = conn.execute(
+        "SELECT run_id, raw_run FROM run_jobs WHERE repo = ? AND fetched_at >= ? "
+        "AND json_extract(raw_run, '$.workflowId') IS NULL",
+        (repo, REST_NAME_BUG_SINCE),
+    ).fetchall()
+    if not rows:
+        return 0
+    affected = {rid: json.loads(rr) for rid, rr in rows}
+    dates = sorted(parse_dt(r["createdAt"]) for r in affected.values())
+    log.info("%d runs cached with run titles as workflow names — re-listing %s → %s",
+             len(affected), dates[0].date(), dates[-1].date())
+    fixed = 0
+    window_end = dates[-1]
+    while window_end >= dates[0] and affected:
+        window_start = window_end - timedelta(days=BACKFILL_WINDOW_DAYS)
+        try:
+            listed = fetch_run_list_complete(repo, since_date=window_start.isoformat(), until_date=window_end.isoformat())
+        except subprocess.CalledProcessError:
+            log.warning("Workflow-name re-list failed; will retry next launch")
+            break
+        with conn:
+            for r in listed:
+                raw_run = affected.pop(r["databaseId"], None)
+                if raw_run is None:
+                    continue
+                raw_run["workflowName"] = r["workflowName"]
+                raw_run["workflowId"] = r.get("workflowId")
+                conn.execute("UPDATE run_jobs SET raw_run = ? WHERE run_id = ?", (json.dumps(raw_run), r["databaseId"]))
+                fixed += 1
+        window_end = window_start
+    log.info("Workflow-name re-list: %d rows relabelled, %d not returned by the API", fixed, len(affected))
+    return fixed
+
+
 def repair_missing_workflow_names(repo: str) -> tuple[int, int, int]:
     """Fill in workflow names for cached runs that were stored without one.
 
@@ -1569,9 +1644,12 @@ def fetch_incremental(repo: str, force_backfill: bool = False) -> list[RunData]:
     # Step 1: cache (repairing runs stored without a workflow name first)
     STATS.set_phase("cache", "Loading cache...")
     try:
+        STATS.set_phase("cache", "Checking cached workflow names...")
+        relabelled = repair_rest_workflow_names(repo)
         blank, from_api, inferred = repair_missing_workflow_names(repo)
-        if blank:
-            STATS.set_phase("cache", f"Repaired workflow names: {from_api} from API, {inferred} inferred")
+        if relabelled or blank:
+            STATS.set_phase("cache", f"Repaired workflow names: {relabelled} relabelled, "
+                                     f"{from_api} from API, {inferred} inferred")
     except Exception:
         log.exception("Workflow-name repair failed; continuing with cached data as-is")
     cached_runs = cache_load_all(repo)
