@@ -55,6 +55,11 @@ jobs:
       id-token: write   # trusted publishing
     steps:
       - uses: astral-sh/setup-uv@v7
+        with:
+          # This job never checks the repo out (it only publishes the built artifact),
+          # so there is no lockfile to key a cache on and the workdir starts empty.
+          enable-cache: false
+          ignore-empty-workdir: true
       - uses: actions/download-artifact@v8
         with:
           name: dist
