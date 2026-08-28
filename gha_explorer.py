@@ -489,12 +489,19 @@ def cache_get_all_ids(repo: str) -> set[int]:
 def cache_load_all(repo: str) -> list[RunData]:
     """Load all cached runs for a repo from SQLite, oldest first."""
     rows = _cache_conn().execute(
-        "SELECT raw_run, raw_jobs FROM run_jobs WHERE repo = ?", (repo,)
+        "SELECT raw_run, raw_jobs, fetched_at FROM run_jobs WHERE repo = ?", (repo,)
     ).fetchall()
     runs = []
-    for raw_run_json, raw_jobs_json in rows:
+    for raw_run_json, raw_jobs_json, fetched_at in rows:
         try:
-            runs.append(build_run_data(json.loads(raw_run_json), json.loads(raw_jobs_json)))
+            run = build_run_data(json.loads(raw_run_json), json.loads(raw_jobs_json))
+            try:
+                run.fetched_at = datetime.fromisoformat(fetched_at)
+                if run.fetched_at.tzinfo is None:
+                    run.fetched_at = run.fetched_at.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                pass
+            runs.append(run)
         except Exception:
             log.debug("Skipping corrupt cache row", exc_info=True)
     runs.sort(key=lambda r: r.created_at)
@@ -580,6 +587,7 @@ class RunData:
     total_duration_s: float
     workflow: str = ""
     jobs: list[JobTiming] = field(default_factory=list)
+    fetched_at: datetime | None = None  # when this run entered the cache
 
 
 def parse_dt(s: str) -> datetime:
@@ -1194,7 +1202,11 @@ class RepoConfig:
     job_groups: dict[str, list[str]] = field(default_factory=dict)  # group name -> member job names
     excluded_workflows: set[str] = field(default_factory=set)
     excluded_jobs: set[str] = field(default_factory=set)  # effective (post-group) job names
-    excluded_branches: set[str] = field(default_factory=set)
+    # Branches are opt-in (new ones appear constantly, so they start excluded);
+    # workflows and jobs are opt-out. None = derived from the data at load time and
+    # not persisted until the user changes a branch setting (see ensure_branch_inclusion).
+    included_branches: set[str] | None = None
+    legacy_excluded_branches: set[str] | None = None  # stored by pre-opt-in versions; left as-is
     rolling_window: int = 3
     # Outlier filter (Hampel: rolling median + MAD). Off by default; hides spikes only
     # unless outlier_both is set.
@@ -1212,7 +1224,9 @@ class RepoConfig:
             "job_groups": self.job_groups,
             "excluded_workflows": sorted(self.excluded_workflows),
             "excluded_jobs": sorted(self.excluded_jobs),
-            "excluded_branches": sorted(self.excluded_branches),
+            "included_branches": sorted(self.included_branches) if self.included_branches is not None else None,
+            "excluded_branches": (sorted(self.legacy_excluded_branches)
+                                  if self.legacy_excluded_branches is not None else None),
             "rolling_window": self.rolling_window,
             "outlier_filter": self.outlier_filter,
             "outlier_k": self.outlier_k,
@@ -1236,7 +1250,8 @@ class RepoConfig:
             job_groups={str(g): [str(m) for m in ms] for g, ms in (data.get("job_groups") or {}).items()},
             excluded_workflows=set(data.get("excluded_workflows") or []),
             excluded_jobs=set(data.get("excluded_jobs") or []),
-            excluded_branches=set(data.get("excluded_branches") or []),
+            included_branches=(set(data["included_branches"]) if data.get("included_branches") is not None else None),
+            legacy_excluded_branches=(set(data["excluded_branches"]) if data.get("excluded_branches") is not None else None),
             rolling_window=window,
             outlier_filter=bool(data.get("outlier_filter", False)),
             outlier_k=_num("outlier_k", 3.0, 1.0, 20.0, float),
@@ -1259,21 +1274,56 @@ def workflow_label(run: RunData) -> str:
     return run.workflow or "(unknown)"
 
 
+BRANCH_OPT_IN_SINCE = datetime(2026, 8, 27, 20, 0, tzinfo=timezone.utc)  # branches became opt-in
+
+
+def ensure_branch_inclusion(cfg: RepoConfig, runs: list[RunData]) -> None:
+    """Derive the opt-in branch set when none has been saved. In memory only —
+    nothing is written until the user changes a branch setting.
+
+    - Repo configured before branches were opt-in (has an exclude list): every
+      branch already in the cache before the cutover, minus the excluded ones.
+      Branches first fetched after the cutover start excluded.
+    - Repo with no branch setting at all: the long-lived branches present
+      (main, develop, ...), or the busiest branch if none of those exist.
+    """
+    if cfg.included_branches is not None or not runs:
+        return
+    counts: dict[str, int] = {}
+    first_seen: dict[str, datetime] = {}
+    for r in runs:
+        if workflow_label(r) in cfg.excluded_workflows:
+            continue
+        counts[r.branch] = counts.get(r.branch, 0) + 1
+        if r.fetched_at is not None:
+            first_seen[r.branch] = min(first_seen.get(r.branch, r.fetched_at), r.fetched_at)
+    if not counts:
+        return
+    if cfg.legacy_excluded_branches is not None:
+        pre_existing = {b for b in counts if first_seen.get(b, BRANCH_OPT_IN_SINCE) < BRANCH_OPT_IN_SINCE}
+        cfg.included_branches = pre_existing - cfg.legacy_excluded_branches
+    else:
+        cfg.included_branches = {b for b in DEFAULT_BRANCHES if b in counts} or {max(counts, key=counts.get)}
+
+
 def apply_repo_config(runs: list[RunData], cfg: RepoConfig) -> list[RunData]:
     """Produce the runs the UI works with: exclusions removed, job groups applied.
 
-    - Excluded workflows/branches drop the whole run (so their jobs disappear too).
+    - Excluded workflows, and branches not opted in, drop the whole run (so their
+      jobs disappear too).
     - Grouped jobs take the group name; if the group has several members, the
       member name becomes the shard key so the breakdown chart compares members
       (this is how matrix shards like "Tests (1)", "Tests (2)" get one line each).
     - Excluded jobs are removed, and the pipeline span is recomputed from what's left.
     """
-    if not (cfg.job_groups or cfg.excluded_workflows or cfg.excluded_jobs or cfg.excluded_branches):
+    if not (cfg.job_groups or cfg.excluded_workflows or cfg.excluded_jobs or cfg.included_branches is not None):
         return runs
     m2g = cfg.member_to_group
     out: list[RunData] = []
     for r in runs:
-        if workflow_label(r) in cfg.excluded_workflows or r.branch in cfg.excluded_branches:
+        if workflow_label(r) in cfg.excluded_workflows:
+            continue
+        if cfg.included_branches is not None and r.branch not in cfg.included_branches:
             continue
         jobs: list[JobTiming] = []
         for j in r.jobs:
@@ -3110,13 +3160,16 @@ class SettingsScreen(Screen[bool]):
                     yield Button("Remove selected group", id="group-remove", variant="error")
             for kind, noun in (("workflows", "workflow"), ("jobs", "job"), ("branches", "branch")):
                 with Vertical(id=kind):
-                    yield Static(
-                        f"Everything is included by default. Select a row (Enter or click) to exclude or "
-                        f"re-include that {noun}."
-                        + (" Excluding a workflow removes its runs, so its jobs drop out of the Jobs tab and "
-                           "the job filter." if kind == "workflows" else ""),
-                        classes="settings-hint",
-                    )
+                    if kind == "branches":
+                        hint = ("Branches are opt-in: new branches show up excluded until you include them here, "
+                                "since they're created all the time. Select a row (Enter or click) to toggle. "
+                                "A new repo starts with its long-lived branches (main, develop, ...).")
+                    else:
+                        hint = (f"Everything is included by default. Select a row (Enter or click) to exclude or "
+                                f"re-include that {noun}."
+                                + (" Excluding a workflow removes its runs, so its jobs drop out of the Jobs tab and "
+                                   "the job filter." if kind == "workflows" else ""))
+                    yield Static(hint, classes="settings-hint")
                     yield DataTable(id=f"{kind}-table", classes="settings-table", cursor_type="row", zebra_stripes=True)
                     with Horizontal(classes="settings-actions"):
                         yield Button("Include all", id=f"{kind}-include-all")
@@ -3159,6 +3212,14 @@ class SettingsScreen(Screen[bool]):
             counts[r.branch] = counts.get(r.branch, 0) + 1
         return counts
 
+    def _included_branches(self) -> set[str]:
+        ensure_branch_inclusion(self.cfg, self.raw_runs)
+        return self.cfg.included_branches if self.cfg.included_branches is not None else set()
+
+    def _excluded_branches(self) -> set[str]:
+        """Branches are opt-in, so 'excluded' = every known branch not in the set."""
+        return set(self._branch_counts()) - self._included_branches()
+
     def _job_counts(self) -> tuple[dict[str, int], dict[str, str]]:
         """Effective (grouped) job names from included workflows/branches, plus the
         workflow(s) each one runs in (busiest first)."""
@@ -3186,7 +3247,7 @@ class SettingsScreen(Screen[bool]):
         keep = set(self.cfg.job_groups.get(self._editing, [])) if self._editing else set()
         counts: dict[str, int] = {}
         for r in self.raw_runs:
-            if workflow_label(r) in self.cfg.excluded_workflows or r.branch in self.cfg.excluded_branches:
+            if workflow_label(r) in self.cfg.excluded_workflows or r.branch not in self._included_branches():
                 continue
             for name in {j.base_name for j in r.jobs}:
                 if m2g.get(name, name) in self.cfg.excluded_jobs and name not in keep:
@@ -3200,7 +3261,7 @@ class SettingsScreen(Screen[bool]):
         self._render_exclusion_table("workflows", self._workflow_counts(), self.cfg.excluded_workflows)
         job_counts, job_workflows = self._job_counts()
         self._render_exclusion_table("jobs", job_counts, self.cfg.excluded_jobs, extra=("Workflow", job_workflows))
-        self._render_exclusion_table("branches", self._branch_counts(), self.cfg.excluded_branches)
+        self._render_exclusion_table("branches", self._branch_counts(), self._excluded_branches())
         self._render_groups()
 
     def _render_exclusion_table(
@@ -3396,18 +3457,21 @@ class SettingsScreen(Screen[bool]):
             return
         name = str(event.row_key.value)
         kind = (event.data_table.id or "").removesuffix("-table")
-        excluded = {"workflows": self.cfg.excluded_workflows, "jobs": self.cfg.excluded_jobs,
-                    "branches": self.cfg.excluded_branches}[kind]
-        if name in excluded:
-            excluded.discard(name)
+        if kind == "branches":
+            included = set(self._included_branches())
+            included.symmetric_difference_update({name})
+            self.cfg.included_branches = included  # first edit persists the opt-in set
         else:
-            excluded.add(name)
+            excluded = self._excluded_set(kind)
+            if name in excluded:
+                excluded.discard(name)
+            else:
+                excluded.add(name)
         self._save()
         self._refresh_all()
 
     def _excluded_set(self, kind: str) -> set[str]:
-        return {"workflows": self.cfg.excluded_workflows, "jobs": self.cfg.excluded_jobs,
-                "branches": self.cfg.excluded_branches}[kind]
+        return {"workflows": self.cfg.excluded_workflows, "jobs": self.cfg.excluded_jobs}[kind]
 
     def _all_names(self, kind: str) -> set[str]:
         if kind == "workflows":
@@ -3421,7 +3485,10 @@ class SettingsScreen(Screen[bool]):
     @on(Button.Pressed, "#branches-include-all")
     def _include_all(self, event: Button.Pressed) -> None:
         kind = (event.button.id or "").removesuffix("-include-all")
-        self._excluded_set(kind).clear()
+        if kind == "branches":
+            self.cfg.included_branches = set(self._branch_counts())
+        else:
+            self._excluded_set(kind).clear()
         self._save()
         self._refresh_all()
 
@@ -3430,7 +3497,10 @@ class SettingsScreen(Screen[bool]):
     @on(Button.Pressed, "#branches-exclude-all")
     def _exclude_all(self, event: Button.Pressed) -> None:
         kind = (event.button.id or "").removesuffix("-exclude-all")
-        self._excluded_set(kind).update(self._all_names(kind))
+        if kind == "branches":
+            self.cfg.included_branches = set()
+        else:
+            self._excluded_set(kind).update(self._all_names(kind))
         self._save()
         self._refresh_all()
 
@@ -3942,6 +4012,9 @@ class GHAExplorerApp(App):
     }
     #trends-scroll {
         height: 1fr;
+        /* Always reserve the scrollbar's 2 columns: charts are sized to this pane's
+           width, and a scrollbar appearing after a render would otherwise wrap them. */
+        scrollbar-gutter: stable;
     }
     #trends-body {
         height: auto;
@@ -4169,6 +4242,7 @@ class GHAExplorerApp(App):
         self._config = load_repo_config(repo)
         cached = cache_load_all(repo)
         self.runs = cached
+        ensure_branch_inclusion(self._config, cached)  # in memory; persisted only if the user edits branches
         self._view_runs = apply_repo_config(cached, self._config)
         self._populate_sidebar()
         if cached:
@@ -4402,6 +4476,7 @@ class GHAExplorerApp(App):
     def _data_loaded(self, data: list[RunData]) -> None:
         try:
             self.runs = data
+            ensure_branch_inclusion(self._config, data)
             self._view_runs = apply_repo_config(data, self._config)
             self.loading = False
             self._update_status_bar(self._cache_status_text(), STATS.message or "Up to date")
@@ -4501,10 +4576,11 @@ class GHAExplorerApp(App):
         self._config = load_repo_config(self.current_repo)
         self._view_runs = apply_repo_config(self.runs, self._config)
         self._populate_sidebar()
-        self._render_all_tabs()
-        log.info("Repo settings applied: %d groups, %d/%d/%d excluded workflows/jobs/branches",
+        self.call_after_refresh(self._render_all_tabs)  # main screen is just back: let it lay out first
+        ensure_branch_inclusion(self._config, self.runs)
+        log.info("Repo settings applied: %d groups, %d/%d excluded workflows/jobs, %d branches included",
                  len(self._config.job_groups), len(self._config.excluded_workflows),
-                 len(self._config.excluded_jobs), len(self._config.excluded_branches))
+                 len(self._config.excluded_jobs), len(self._config.included_branches or []))
 
     # -- Notes --
 
@@ -4669,7 +4745,7 @@ class GHAExplorerApp(App):
             width = self.query_one("#trends-body").content_size.width
         except Exception:
             width = 0
-        if width <= 0:
+        if width <= 0:  # not laid out yet: sidebar/strip + 2 scrollbar gutter + 2 body padding
             width = self.size.width - (self.SIDEBAR_WIDTH if self._sidebar_visible else self.STRIP_WIDTH) - 4
         return max(width, 60)
 
