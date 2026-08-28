@@ -3773,19 +3773,9 @@ class FilterSidebar(Vertical):
     FilterSidebar OptionList:focus, FilterSidebar SelectionList:focus {
         border: none;
     }
-    FilterSidebar .sidebar-footer {
-        dock: bottom;
-        height: 3;
-        align-horizontal: right;
-        padding-right: 1;
-    }
-    /* .sidebar-collapse itself is styled in the App CSS: rules here would lose to
-       Button's own DEFAULT_CSS. */
     """
 
     def compose(self) -> ComposeResult:
-        with Horizontal(classes="sidebar-footer"):
-            yield Button("<", classes="sidebar-collapse", tooltip="Collapse filters (f)")
         yield Label("Workflow")
         yield OptionList(classes="workflow-select")
         yield Label("Job")
@@ -3887,7 +3877,7 @@ class GHAExplorerApp(App):
     CSS = """
     Screen {
         background: $background;
-        layers: base notes;
+        layers: base toggles notes;
     }
     #trends-header {
         height: 1;
@@ -3958,18 +3948,17 @@ class GHAExplorerApp(App):
         padding: 0 1;
     }
     .sidebar-strip {
-        width: 5;
+        width: 3;
         height: 1fr;
         border-right: solid $secondary;
         background: $surface;
-        padding: 1 0 1 0;
         display: none;
     }
-    .sidebar-strip Button {
+    /* The < / > sidebar toggle: one per tab, on its own layer, docked bottom and
+       offset so it sits astride the sidebar's border line (see _apply_sidebar_visibility). */
+    .sidebar-toggle {
+        layer: toggles;
         dock: bottom;
-    }
-    /* The < and > sidebar toggles: bordered in the accent colour so they read as clickable. */
-    .sidebar-strip Button, .sidebar-collapse {
         min-width: 5;
         width: 5;
         height: 3;
@@ -3978,12 +3967,12 @@ class GHAExplorerApp(App):
         color: $primary;
         text-style: bold;
     }
-    .sidebar-strip Button:hover, .sidebar-collapse:hover {
+    .sidebar-toggle:hover {
         background: $primary 30%;
         color: $text;
         border: round $primary;
     }
-    .sidebar-strip Button:focus, .sidebar-collapse:focus {
+    .sidebar-toggle:focus {
         border: round $primary;
         text-style: bold;
     }
@@ -4096,9 +4085,9 @@ class GHAExplorerApp(App):
             yield Static("[@click=app.open_settings]⚙ Settings[/]", id="settings-button")
         with ContentSwitcher(initial="trends", id="content"):
             with Horizontal(id="trends"):
-                with Vertical(classes="sidebar-strip"):
-                    yield Button(">", classes="sidebar-expand", tooltip="Show filters (f)")
+                yield Vertical(classes="sidebar-strip")
                 yield FilterSidebar()
+                yield Button("<", classes="sidebar-toggle")
                 with Vertical(classes="tab-body"):
                     with Horizontal(id="trends-header"):
                         yield Static("", id="trends-stats")
@@ -4106,9 +4095,9 @@ class GHAExplorerApp(App):
                     with VerticalScroll(id="trends-scroll"):
                         yield TrendChart(id="trends-body")
             with Horizontal(id="runs-tab"):
-                with Vertical(classes="sidebar-strip"):
-                    yield Button(">", classes="sidebar-expand", tooltip="Show filters (f)")
+                yield Vertical(classes="sidebar-strip")
                 yield FilterSidebar()
+                yield Button("<", classes="sidebar-toggle")
                 yield DataTable(id="runs-table", classes="tab-body")
             with Vertical(id="status-tab", classes="status-pane"):
                 with Horizontal(id="status-cards"):
@@ -4673,8 +4662,16 @@ class GHAExplorerApp(App):
         })
 
     def _content_width(self) -> int:
-        sidebar = 34 if self._sidebar_visible else 6
-        return max(self.size.width - sidebar, 60)
+        """Columns available for a chart: the Trends body's content width once laid
+        out, else derived from the sidebar/strip width plus the scroll pane's
+        2-column scrollbar and the body's 1-column padding on each side."""
+        try:
+            width = self.query_one("#trends-body").content_size.width
+        except Exception:
+            width = 0
+        if width <= 0:
+            width = self.size.width - (self.SIDEBAR_WIDTH if self._sidebar_visible else self.STRIP_WIDTH) - 4
+        return max(width, 60)
 
     def _fit_tabs(self) -> None:
         """Shrink the Tabs strip to its labels so the underline doesn't run past them."""
@@ -4683,14 +4680,23 @@ class GHAExplorerApp(App):
         if total:
             tabs.styles.width = total
 
-    def _apply_sidebar_visibility(self) -> None:
-        for sidebar in self.query(FilterSidebar):
-            sidebar.display = self._sidebar_visible
-        for strip in self.query(".sidebar-strip"):
-            strip.display = not self._sidebar_visible
+    SIDEBAR_WIDTH = 30  # FilterSidebar CSS width, border included
+    STRIP_WIDTH = 3     # .sidebar-strip width when collapsed
 
-    @on(Button.Pressed, ".sidebar-collapse")
-    @on(Button.Pressed, ".sidebar-expand")
+    def _apply_sidebar_visibility(self) -> None:
+        visible = self._sidebar_visible
+        for sidebar in self.query(FilterSidebar):
+            sidebar.display = visible
+        for strip in self.query(".sidebar-strip"):
+            strip.display = not visible
+        # Centre the 5-wide toggle on the border line: line at (width - 1), glyph at offset + 2.
+        line_x = (self.SIDEBAR_WIDTH if visible else self.STRIP_WIDTH) - 1
+        for btn in self.query(".sidebar-toggle"):
+            btn.label = "<" if visible else ">"
+            btn.tooltip = "Collapse filters (f)" if visible else "Show filters (f)"
+            btn.styles.offset = (line_x - 2, 0)
+
+    @on(Button.Pressed, ".sidebar-toggle")
     def _on_sidebar_button(self, event: Button.Pressed) -> None:
         event.stop()
         self.action_toggle_sidebar()
@@ -4701,7 +4707,7 @@ class GHAExplorerApp(App):
         self._apply_sidebar_visibility()
         settings_set(GLOBAL_SCOPE, "sidebar_visible", self._sidebar_visible)
         if self.runs:
-            self._render_all_tabs()  # charts re-render at the new width
+            self.call_after_refresh(self._render_all_tabs)  # re-render once the layout has the new width
 
     def _plot_height(self, fraction: float = 0.5, minimum: int = 12) -> int:
         available = max(self.size.height - 7, 20)
