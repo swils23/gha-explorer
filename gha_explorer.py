@@ -4296,9 +4296,11 @@ class GHAExplorerApp(App):
     }
     #trends-scroll {
         height: 1fr;
-        /* Always reserve the scrollbar's 2 columns: charts are sized to this pane's
-           width, and a scrollbar appearing after a render would otherwise wrap them. */
+        /* Always reserve the scrollbar column: charts are sized to this pane's width,
+           and a scrollbar appearing after a render would otherwise wrap them. One
+           column wide — Textual's default 2-wide bar reads as two separate bars. */
         scrollbar-gutter: stable;
+        scrollbar-size-vertical: 1;
     }
     #trends-body {
         height: auto;
@@ -5372,8 +5374,8 @@ class GHAExplorerApp(App):
             width = self.query_one("#trends-body").content_size.width
         except Exception:
             width = 0
-        if width <= 0:  # not laid out yet: sidebar/strip + 2 scrollbar gutter + 2 body padding
-            width = self.size.width - (self.SIDEBAR_WIDTH if self._sidebar_visible else self.STRIP_WIDTH) - 4
+        if width <= 0:  # not laid out yet: sidebar/strip + 1 scrollbar column + 2 body padding
+            width = self.size.width - (self.SIDEBAR_WIDTH if self._sidebar_visible else self.STRIP_WIDTH) - 3
         return max(width, 60)
 
     def _fit_tabs(self) -> None:
