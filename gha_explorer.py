@@ -331,6 +331,7 @@ class SyncStats:
     detail_budget: int | None = None   # None = uncapped (shift+R)
     detail_budget_left: int = 0
     deferred_runs: int = 0
+    history_pending: bool = False       # older history skipped this sync because the allowance is spent
     resume_at: float | None = None      # epoch: when the deferred remainder can continue
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
@@ -352,6 +353,7 @@ class SyncStats:
             self.detail_budget = None
             self.detail_budget_left = 0
             self.deferred_runs = 0
+            self.history_pending = False
             self.resume_at = None
 
     def set_phase(self, phase: str, message: str = "") -> None:
@@ -1648,17 +1650,42 @@ def _fetch_and_build(repo: str, raw_run: dict, retries: int = 2) -> RunData:
     raise RuntimeError("unreachable")
 
 
+BUDGET_WINDOW_KEY = "api_budget_window"  # global setting: {"reset": epoch, "allowance": n, "spent": n}
+
+
 def _set_details_budget(force: bool) -> None:
-    """Decide how many job-timing requests this sync may make: half of what is left in
-    the hour's budget (known from the listing's response headers), so charts appear
-    this hour and other tools keep working. shift+R lifts the cap (waits for resets)."""
+    """Decide how many job-timing requests this sync may make.
+
+    The allowance is half of what was left in the hour's budget when the window was
+    first seen, and it is remembered per window (keyed by the reset time from the
+    response headers). A relaunch inside the same hour therefore continues the same
+    allowance instead of taking half of whatever remains again — otherwise every
+    restart would carve off another slice. shift+R lifts the cap (waits for resets).
+    """
     view = None if force else rate_limit_view(STATS.snapshot())
     if view is None:
         STATS.detail_budget, STATS.detail_budget_left = None, 0
         return
-    STATS.detail_budget = STATS.detail_budget_left = max(0, view["remaining"] // 2)
-    STATS.resume_at = view.get("reset")
-    log.info("Job-timing budget for this sync: %d requests (half of %d remaining)", STATS.detail_budget, view["remaining"])
+    reset = int(view.get("reset") or 0)
+    stored = settings_get(GLOBAL_SCOPE, BUDGET_WINDOW_KEY) or {}
+    if reset and stored.get("reset") and abs(int(stored["reset"]) - reset) <= 5:
+        allowance, spent = int(stored.get("allowance", 0)), int(stored.get("spent", 0))
+        log.info("Continuing this hour's job-timing allowance: %d of %d already used", spent, allowance)
+    else:
+        allowance, spent = max(0, view["remaining"] // 2), 0
+        settings_set(GLOBAL_SCOPE, BUDGET_WINDOW_KEY, {"reset": reset, "allowance": allowance, "spent": 0})
+        log.info("Job-timing allowance for this hour: %d requests (half of %d remaining)", allowance, view["remaining"])
+    STATS.detail_budget = allowance
+    STATS.detail_budget_left = max(0, min(allowance - spent, view["remaining"]))
+    STATS.resume_at = reset or None
+
+
+def _record_budget_spent(n: int) -> None:
+    if n <= 0:
+        return
+    stored = settings_get(GLOBAL_SCOPE, BUDGET_WINDOW_KEY) or {}
+    stored["spent"] = int(stored.get("spent", 0)) + n
+    settings_set(GLOBAL_SCOPE, BUDGET_WINDOW_KEY, stored)
 
 
 def _take_within_budget(raw_runs: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -1668,6 +1695,7 @@ def _take_within_budget(raw_runs: list[dict]) -> tuple[list[dict], list[dict]]:
     n = max(0, STATS.detail_budget_left)
     take, defer = raw_runs[:n], raw_runs[n:]
     STATS.detail_budget_left -= len(take)
+    _record_budget_spent(len(take))
     if defer:
         STATS.deferred_runs += len(defer)
         log.info("Deferring %d runs to stay within the API budget (%d deferred so far)", len(defer), STATS.deferred_runs)
@@ -1950,8 +1978,9 @@ def fetch_incremental(repo: str, force_backfill: bool = False) -> list[RunData]:
         new_runs.sort(key=lambda r: r.created_at)
         oldest_date = new_runs[0].created_at
 
-    if STATS.deferred_runs or (STATS.detail_budget is not None and STATS.detail_budget_left <= 0):
+    if not backfill_done and (STATS.deferred_runs or (STATS.detail_budget is not None and STATS.detail_budget_left <= 0)):
         backfill_done = True  # out of budget for this sync; the next one continues from the oldest cached run
+        STATS.history_pending = True
         log.info("Skipping older history this sync — API budget for job timings is used up")
     if oldest_date and not backfill_done:
         repo_created = fetch_repo_created_at(repo)
@@ -2021,10 +2050,12 @@ def fetch_incremental(repo: str, force_backfill: bool = False) -> list[RunData]:
     meta_set(repo)
 
     if STATS.phase != "rate-limited":
+        when = f" — continues at {fmt_reset(STATS.resume_at)}" if STATS.resume_at else " on the next sync"
         if STATS.deferred_runs:
-            when = f" — continues at {fmt_reset(STATS.resume_at)}" if STATS.resume_at else ""
             STATS.set_phase("done", f"+{total_new:,} runs fetched · {STATS.deferred_runs:,} older runs deferred "
                                     f"to save API budget{when}")
+        elif STATS.history_pending:
+            STATS.set_phase("done", f"{len(all_runs):,} runs · older history waits for this hour's API allowance{when}")
         elif total_new:
             STATS.set_phase("done", f"+{total_new} new runs fetched — {len(all_runs)} total")
         else:
@@ -5043,11 +5074,11 @@ class GHAExplorerApp(App):
         if timer is not None:
             timer.stop()
             self._resume_timer = None
-        if not STATS.deferred_runs or STATS.resume_at is None:
+        if not (STATS.deferred_runs or STATS.history_pending) or STATS.resume_at is None:
             return
         delay = max(15.0, STATS.resume_at - time.time() + 15)
         self._resume_timer = self.set_timer(delay, self._auto_resume)
-        log.info("Will continue fetching %d deferred runs at %s", STATS.deferred_runs, fmt_reset(STATS.resume_at))
+        log.info("Will continue with older history at %s", fmt_reset(STATS.resume_at))
 
     def _auto_resume(self) -> None:
         self._resume_timer = None
