@@ -355,6 +355,7 @@ MAX_WORKERS = 8
 RUN_LIST_LIMIT = 1000  # hard cap of `gh run list --limit`
 BACKFILL_WINDOW_DAYS = 90
 MAX_BACKFILL_WINDOWS = 80  # ~20 years; safety valve only
+GAP_DAYS = 7  # a hole this long between cached runs is checked against the API once
 
 TIME_RANGES: dict[str, timedelta | None] = {
     "1d": timedelta(days=1),
@@ -1511,6 +1512,39 @@ def fetch_incremental(repo: str, force_backfill: bool = False) -> list[RunData]:
         STATS.set_phase("details", f"Fetching details for {len(forward_new)} new runs...")
         new_runs.extend(_fetch_jobs_for_runs(repo, forward_new))
         cached_ids.update(r.run_id for r in new_runs)
+
+    # Step 2b: holes in the middle of cached history. Forward fetch only looks newer
+    # than the newest cached run and backfill only older than the oldest, so a gap
+    # left by an interrupted or capped sync would otherwise never be filled. Each
+    # gap is queried once; genuinely quiet periods are remembered so they aren't
+    # re-queried every launch (runs can't appear in the past).
+    if force_backfill:
+        settings_set(repo, "verified_gaps", [])
+    verified = {tuple(g) for g in (settings_get(repo, "verified_gaps", []) or [])}
+    known = sorted({r.created_at for r in cached_runs} | {r.created_at for r in new_runs})
+    gaps = [
+        (a, b) for a, b in zip(known, known[1:])
+        if (b - a) >= timedelta(days=GAP_DAYS) and (a.date().isoformat(), b.date().isoformat()) not in verified
+    ]
+    if gaps:
+        log.info("Checking %d gap(s) of %d+ days in cached history", len(gaps), GAP_DAYS)
+    for a, b in gaps:
+        label = f"{a:%Y-%m-%d} → {b:%Y-%m-%d}"
+        STATS.set_phase("gaps", f"Checking gap {label}...")
+        try:
+            gap_raw = fetch_run_list_complete(repo, since_date=a.isoformat(), until_date=b.isoformat())
+        except subprocess.CalledProcessError:
+            log.warning("Gap check %s failed — likely rate limited; will retry next launch", label)
+            break
+        gap_new = [r for r in gap_raw if r["databaseId"] not in cached_ids]
+        log.info("Gap %s: %d listed, %d new", label, len(gap_raw), len(gap_new))
+        if gap_new:
+            STATS.set_phase("details", f"Fetching details for {len(gap_new)} runs in gap {label}...")
+            gap_runs = _fetch_jobs_for_runs(repo, gap_new)
+            new_runs.extend(gap_runs)
+            cached_ids.update(r.run_id for r in gap_runs)
+        verified.add((a.date().isoformat(), b.date().isoformat()))
+        settings_set(repo, "verified_gaps", sorted(list(g) for g in verified))
 
     # Step 3: backfill
     backfill_done = meta_get_backfill_complete(repo) and not force_backfill
@@ -4071,7 +4105,7 @@ class GHAExplorerApp(App):
             "done": p.success_hex, "error": p.error_hex, "rate-limited": p.error_hex, "idle": p.muted_hex,
         }
         phase_text = RichText()
-        labels = {"cache": "CACHE", "forward": "LIST", "details": "FETCH", "backfill": "BACKFILL",
+        labels = {"cache": "CACHE", "forward": "LIST", "details": "FETCH", "backfill": "BACKFILL", "gaps": "GAPS",
                   "done": "DONE", "error": "ERROR", "rate-limited": "LIMITED", "idle": "IDLE"}
         phase_text.append(f"{labels.get(phase, phase.upper()):<9}",
                           style=f"bold {phase_colors.get(phase, p.primary_hex)}")
@@ -4242,7 +4276,7 @@ class GHAExplorerApp(App):
         self._start_fetch()
 
     def action_full_rescan(self) -> None:
-        """Re-run backfill even if it previously completed (finds runs missed by API hiccups)."""
+        """Re-run backfill and re-check every gap, even ones previously verified as quiet."""
         if self.loading:
             self.notify("A sync is already running.", severity="warning", timeout=3)
             return
