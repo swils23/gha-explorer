@@ -4349,6 +4349,7 @@ class GHAExplorerApp(App):
 
     def _update_status_bar(self, cache_msg: str = "", activity_msg: str = "") -> None:
         try:
+            self._status_parts = (cache_msg, activity_msg)
             status = self.query_one("#status-bar", Static)
             text = RichText()
             if cache_msg:
@@ -4358,7 +4359,10 @@ class GHAExplorerApp(App):
                     text.append("  ·  ", style="#3A3450")
                 text.append(activity_msg, style=self.palette.primary_hex)
             rl = STATS.rate_limit
-            if rl:
+            self._status_rl_shown = (rl or {}).get("remaining"), (rl or {}).get("limit")
+            # The budget is only interesting once some of it has been spent (the Status
+            # tab always shows the full gauge).
+            if rl and rl.get("limit") and rl["remaining"] < rl["limit"]:
                 text.append("  ·  ", style="#3A3450")
                 frac = rl["remaining"] / rl["limit"] if rl.get("limit") else 1
                 color = self.palette.error_hex if frac < 0.1 else self.palette.warning_hex if frac < 0.3 else self.palette.muted_hex
@@ -4396,6 +4400,11 @@ class GHAExplorerApp(App):
                 self._update_status_bar(self._cache_status_text(), self._activity_text(s))
                 if not self.runs and self.current_repo:
                     self._render_first_sync_panel(s)
+            else:
+                # Idle: the 30 s rate-limit poll keeps updating; redraw the bar when the numbers move
+                rl = s["rate_limit"] or {}
+                if (rl.get("remaining"), rl.get("limit")) != getattr(self, "_status_rl_shown", (None, None)):
+                    self._update_status_bar(*getattr(self, "_status_parts", ("", "")))
             self._render_status(s)
         except Exception:
             log.debug("tick error", exc_info=True)
